@@ -7,13 +7,14 @@ final VOD, in the best quality YouTube offers.
 
 ![Reprise](Artwork/Reprise.png)
 
-## Version 1.6.75
+## Latest release
 
-New in this version: a redesigned main window with **Scheduled**, **Incoming** and
-**Recordings**, a clear card for the next premiere with the steps
-Verified → Monitoring → Capture LIVE → Save VOD, and confirmation of exactly which VOD
-version was downloaded: resolution, codec and frame rate, in the app and in the push
-notification. Also fixed: a dark band that could cover the page title.
+[Download Reprise and see what's new](https://github.com/reprise-labs/reprise/releases/latest).
+
+Reprise automatically updates the start time when YouTube reschedules a tracked
+premiere. After a restart, it identifies interrupted recordings and retries when the
+broadcast or replay becomes available. The Scheduled view puts active recordings
+and downloads first.
 
 Apple Silicon, macOS 14 or later. The app is signed locally and not notarized by Apple.
 Reprise uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) and ffmpeg; you install those
@@ -21,7 +22,7 @@ separately.
 
 ## Installation
 
-Download `Reprise.zip` from [Releases](https://github.com/reprise-labs/reprise/releases).
+Download `Reprise.zip` from the [latest release](https://github.com/reprise-labs/reprise/releases/latest).
 
 1. Install yt-dlp and ffmpeg with [Homebrew](https://brew.sh): `brew install yt-dlp ffmpeg`.
 2. Unzip the file and move `Reprise.app` to your Applications folder.
@@ -51,10 +52,11 @@ At startup Reprise checks three things and opens its window if anything is missi
 
 - **Adding a premiere:** paste the YouTube link via *Add premiere*. Reprise reads the
   scheduled time and asks which quality you want (Best or Premium).
-- **Scheduled:** the next premiere with its progress, the rest below it, and the most
-  recently completed recording.
-- **Incoming:** new premieres Reprise finds on channels you follow. Add channels in
-  Settings; Reprise checks once a day, or right away with *Check now*.
+- **Scheduled:** the active recording or download, or your next premiere, followed by
+  the other tracked premieres and the most recently completed recording.
+- **Incoming:** new premieres Reprise finds on channels you follow. Set the discovery
+  interval in Settings, use *Check now* for an immediate check, or enable
+  *Auto-schedule* per channel to add premieres with a known start time directly.
 - **Recordings:** every completed recording, each with the version that was downloaded.
 - **Menu bar:** red means something needs attention, blue means a download is running,
   green means everything is fine. Right-click for a quick status menu.
@@ -62,11 +64,12 @@ At startup Reprise checks three things and opens its window if anything is missi
 
 ## What Reprise does
 
-- Shortly before the scheduled time, Reprise starts checking the video's status.
+- Reprise checks for schedule changes before the recording window and checks more
+  frequently as the scheduled start approaches.
 - As soon as the premiere goes live, recording starts immediately, from the beginning of
   the broadcast.
-- Then Reprise waits until YouTube offers the VOD in full quality, with separate video and
-  audio tracks. A low-quality fallback version is never kept; Reprise tries again later.
+- After the live recording, Reprise waits for higher-quality VOD formats. After a
+  configurable wait, you can choose to download the available version.
 - The downloaded version is compared with the highest quality that was available for the
   video. Only after a real comparison does it say *confirmed best available*.
 - 24 hours and 1 hour beforehand there's a check: yt-dlp up to date, folder and cookie
