@@ -638,6 +638,10 @@ private struct NextPremiereCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+            if video.interruptedDownload != nil {
+                InterruptedDownloadDetails(video: video)
+                    .padding(.top, 12)
+            }
         }
         .padding(18)
         .background(.background, in: RoundedRectangle(cornerRadius: 14))
@@ -676,6 +680,9 @@ private struct ScheduledVideoRow: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
+                if video.interruptedDownload != nil {
+                    InterruptedDownloadDetails(video: video)
+                }
             }
             Spacer()
             StatusBadge(status: video.status)
@@ -692,6 +699,24 @@ private struct ScheduledVideoRow: View {
             .accessibilityLabel("Actions for \(video.label)")
         }
         .padding(.vertical, 10)
+    }
+}
+
+private struct InterruptedDownloadDetails: View {
+    let video: MonitoredVideo
+
+    var body: some View {
+        if let interruption = video.interruptedDownload {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(interruption.recoveryMessage, systemImage: "arrow.clockwise.circle")
+                Button("Show download folder") {
+                    MonitorEngine.shared.revealInterruptedDownloadFolder(video)
+                }
+                .controlSize(.small)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
     }
 }
 

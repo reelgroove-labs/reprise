@@ -115,6 +115,22 @@ enum VideoStatus: String, Codable {
     }
 }
 
+struct InterruptedDownload: Codable, Equatable {
+    enum Kind: String, Codable {
+        case live, vod
+    }
+
+    var kind: Kind
+    var folder: String?
+
+    var recoveryMessage: String {
+        switch kind {
+        case .live: return "LIVE recording interrupted. Reprise will check for the broadcast and replay."
+        case .vod: return "VOD download interrupted. Reprise will retry when the replay is available."
+        }
+    }
+}
+
 struct MonitoredVideo: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var url: String
@@ -128,6 +144,8 @@ struct MonitoredVideo: Identifiable, Codable, Equatable {
     var liveFilePath: String? = nil
     var vodWaitingSince: Date? = nil
     var vodWaitReason: String? = nil
+    var activeDownloadFolder: String? = nil
+    var interruptedDownload: InterruptedDownload? = nil
     /// Of de "premiere is live"-melding al verstuurd is. Losgekoppeld van
     /// liveDone, want dat vlaggetje gaat pas aan bij een geslaagde download —
     /// waardoor een mislukking elke ronde opnieuw dezelfde melding stuurde.

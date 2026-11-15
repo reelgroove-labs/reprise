@@ -94,7 +94,8 @@ final class MonitorEngine: ObservableObject {
                 ? "Reprise loaded the recovery copy. Save it to restore the schedule on disk."
                 : "Reprise could not read the schedule. Check the files in Application Support."
         }
-        startLoop()          // tick() draait meteen, en checkt daarbinnen ook yt-dlp
+        restoreInterruptedDownloads()
+        startLoop()
     }
 
     /// Application Support/Reprise/Backups holds whole "Reprise.app.backup-<date>" copies
@@ -996,6 +997,8 @@ final class MonitorEngine: ObservableObject {
             v.liveFilePath = nil
             v.vodWaitingSince = nil
             v.vodWaitReason = nil
+            v.activeDownloadFolder = nil
+            v.interruptedDownload = nil
             lastVodCheck[id] = nil
         } else if dateChanged {
             // Same video, new time: let the pre-flight pushes fire again for the new date.
@@ -1027,6 +1030,28 @@ final class MonitorEngine: ObservableObject {
     func nextVodCheck(_ video: MonitoredVideo) -> Date? {
         guard video.status == .vodPending else { return nil }
         return lastVodCheck[video.id]?.addingTimeInterval(vodWaitInterval)
+    }
+
+    func revealInterruptedDownloadFolder(_ video: MonitoredVideo) {
+        guard let interruption = video.interruptedDownload else { return }
+        NSWorkspace.shared.open(recoveryFolder(for: interruption))
+    }
+
+    private func recoveryFolder(for interruption: InterruptedDownload) -> URL {
+        if let path = interruption.folder {
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                return url
+            }
+        }
+        return downloadRoot
+    }
+
+    private func downloadFolder(for video: MonitoredVideo, kind: InterruptedDownload.Kind) -> URL {
+        if let interruption = video.interruptedDownload, interruption.kind == kind {
+            return recoveryFolder(for: interruption)
+        }
+        return downloadRoot
     }
 
     func revealLiveRecording(_ video: MonitoredVideo) {
@@ -1665,6 +1690,7 @@ final class MonitorEngine: ObservableObject {
         let hasFormats = !((meta["formats"] as? [Any])?.isEmpty ?? true)
 
         if liveStatus == "is_live" { return "live" }
+        if liveStatus == "is_upcoming" || liveStatus == "post_live" { return nil }
         if let liveStatus, ["was_live", "not_live"].contains(liveStatus), Date() >= scheduled, hasFormats {
             return "vod"
         }
@@ -1729,7 +1755,7 @@ final class MonitorEngine: ObservableObject {
         log("Download(s) finished — no longer preventing sleep.")
     }
 
-    private func downloadVideo(url: String, label: String, tag: String, isLive: Bool, videoId: UUID, quality: VideoQuality, meta: [String: Any], formatFilterOverride: String? = nil) async -> (ok: Bool, path: String?, formatId: String?, qualityLabel: String?, qualityConfirmed: Bool?) {
+    private func downloadVideo(url: String, label: String, tag: String, isLive: Bool, videoId: UUID, quality: VideoQuality, meta: [String: Any], formatFilterOverride: String? = nil, destination: URL? = nil) async -> (ok: Bool, path: String?, formatId: String?, qualityLabel: String?, qualityConfirmed: Bool?) {
         preventSleepIfNeeded()
         defer { allowSleepIfIdle() }
 
@@ -1740,7 +1766,7 @@ final class MonitorEngine: ObservableObject {
         // the name — reddenNaFout() greps for it to salvage a stream that ended
         // before the merge — but where it sits is free, so it doesn't need to
         // clutter the part you actually read.
-        let root = downloadRoot
+        let root = destination ?? downloadRoot
         let outTemplate = root.appendingPathComponent(
             "%(title)s [\(tag)] (%(id)s).%(ext)s").path
         var args = [
@@ -2693,6 +2719,56 @@ final class MonitorEngine: ObservableObject {
         saveSchedule()
     }
 
+    private let scheduleRefreshInterval: TimeInterval = 15 * 60
+
+    private func restoreInterruptedDownloads() {
+        var recovered = false
+        for index in videos.indices {
+            var video = videos[index]
+            guard !video.vodDone else { continue }
+            switch video.status {
+            case .downloadingLive:
+                video.interruptedDownload = InterruptedDownload(kind: .live, folder: video.activeDownloadFolder)
+                video.status = .waiting
+                video.retryNotBefore = nil
+            case .downloadingVod:
+                video.interruptedDownload = InterruptedDownload(kind: .vod, folder: video.activeDownloadFolder)
+                video.status = .vodPending
+                video.vodWaitingSince = video.vodWaitingSince ?? video.liveFinishedAt ?? Date()
+                video.vodWaitReason = "Checking for a VOD to resume."
+            default:
+                continue
+            }
+            video.activeDownloadFolder = nil
+            video.lastChecked = nil
+            videos[index] = video
+            recovered = true
+            log("[\(video.label)] \(video.interruptedDownload?.recoveryMessage ?? "")")
+        }
+        if recovered { saveSchedule() }
+    }
+
+    private func applyScheduleChange(to video: inout MonitoredVideo, newDate: Date) {
+        guard let index = videos.firstIndex(where: { $0.id == video.id }),
+              videos[index].url == video.url, videos[index].scheduledDate == video.scheduledDate,
+              abs(newDate.timeIntervalSince(video.scheduledDate)) >= 1 else { return }
+        let oldDate = video.scheduledDate
+        video.scheduledDate = newDate
+        video.dayBeforeCheckNotified = nil
+        video.hourBeforeCheckNotified = nil
+        video.stillWaitingNotified = nil
+        video.retryNotBefore = nil
+        loggedWindowStart.remove(video.id)
+        lastStalledCheck[video.id] = nil
+        videos[index].scheduledDate = newDate
+        writeBack(video, id: video.id)
+        let oldTime = oldDate.formatted(date: .abbreviated, time: .shortened)
+        let newTime = newDate.formatted(date: .abbreviated, time: .shortened)
+        let message = "\(video.label): \(oldTime) → \(newTime)"
+        log("Premiere rescheduled — \(message)")
+        notify(title: "Premiere rescheduled", message: message)
+    }
+
     private func checkOneVideo(index: Int, forceCheck: Bool = false, acceptAvailableVod: Bool = false) async {
         guard videos.indices.contains(index) else { return }
         let videoId = videos[index].id
@@ -2713,12 +2789,6 @@ final class MonitorEngine: ObservableObject {
         //
         // Inhoudelijk is de VOD ook de volledige versie; de live-opname is het
         // vangnet voor als er nooit een VOD komt.
-        if v.status == .downloadingVod && !v.vodDone {
-            v.status = .vodPending
-            v.vodWaitingSince = v.vodWaitingSince ?? v.liveFinishedAt ?? Date()
-            v.vodWaitReason = "The previous VOD download was interrupted."
-            writeBack(v, id: videoId)
-        }
         if v.vodDone {
             // vodDone staying true forever if the file disappears meant this guard
             // returned before any download logic ran at all — "Check now" did
@@ -2740,13 +2810,14 @@ final class MonitorEngine: ObservableObject {
             writeBack(v, id: videoId)
         }
 
+        var scheduleCheckOnly = false
         if !forceCheck {
-            // Before the window around the scheduled time: don't check anything at all.
+            // Refresh distant schedules without polling them at the live cadence.
             if !v.liveDone && v.status != .vodPending {
                 let checkFrom = v.scheduledDate.addingTimeInterval(-checkLeadTime)
-                if Date() < checkFrom {
-                    if v.status != .waiting { v.status = .waiting; writeBack(v, id: videoId) }
-                    return
+                if Date() < checkFrom && v.interruptedDownload == nil {
+                    if let last = v.lastChecked, Date().timeIntervalSince(last) < scheduleRefreshInterval { return }
+                    scheduleCheckOnly = true
                 }
             }
 
@@ -2772,7 +2843,7 @@ final class MonitorEngine: ObservableObject {
             // second check, lastChecked no longer nil, and notify correctly then.
             if !v.liveDone && v.status != .vodPending && v.lastChecked != nil
                 && Date().timeIntervalSince(v.scheduledDate) > stillWaitingThreshold {
-                if v.stillWaitingNotified != true {
+                if v.interruptedDownload == nil && v.stillWaitingNotified != true {
                     v.stillWaitingNotified = true
                     writeBack(v, id: videoId)
                     log("[\(v.label)] Still not live \(Int(stillWaitingThreshold / 86400)) days after the "
@@ -2794,11 +2865,10 @@ final class MonitorEngine: ObservableObject {
                 if let last, Date().timeIntervalSince(last) < vodWaitInterval {
                     return
                 }
-
             }
         }
 
-        if !loggedWindowStart.contains(v.id) {
+        if !scheduleCheckOnly && !loggedWindowStart.contains(v.id) {
             loggedWindowStart.insert(v.id)
             log("[\(v.label)] Check window started (scheduled time: \(v.scheduledDate.formatted(date: .abbreviated, time: .standard)))")
         }
@@ -2819,14 +2889,25 @@ final class MonitorEngine: ObservableObject {
             // er iets mis was tot hij het zelf navroeg. Dezelfde afkoeltijd
             // als de andere mislukkingen, zodat dit niet elke 30 seconden
             // opnieuw afgaat.
-            notifyFailureThrottled(videoId: v.id, title: "\(v.label) — check failing",
-                                   message: "Could not fetch video info: \(detail.isEmpty ? "see the log on the Mac Mini." : detail)")
+            if !scheduleCheckOnly {
+                notifyFailureThrottled(videoId: v.id, title: "\(v.label) — check failing",
+                                       message: "Could not fetch video info: \(detail.isEmpty ? "see the log on the Mac Mini." : detail)")
+            }
             return
         }
 
         let liveStatus = meta["live_status"] as? String ?? "unknown"
         let availability = meta["availability"] as? String ?? "unknown"
+        if liveStatus == "is_upcoming", !v.liveDone,
+           let newDate = premiereDate(in: meta), newDate.timeIntervalSince1970.isFinite,
+           newDate.timeIntervalSince1970 > 0 {
+            applyScheduleChange(to: &v, newDate: newDate)
+        }
         let phase = desiredPhase(meta: meta, scheduled: v.scheduledDate)
+        if scheduleCheckOnly, phase != "live", Date() < v.scheduledDate.addingTimeInterval(-checkLeadTime) {
+            writeBack(v, id: videoId)
+            return
+        }
         log("[\(v.label)] Check: live_status=\(liveStatus), availability=\(availability), phase=\(phase ?? "not yet")")
 
         // The real, best chance to confirm Premium: lookupVideoInfo's check at
@@ -2854,9 +2935,12 @@ final class MonitorEngine: ObservableObject {
                 notify(title: "Premiere is live!", message: "\(v.label) went live, download started.")
                 v.liveNotified = true
             }
+            let folder = downloadFolder(for: v, kind: .live)
             v.status = .downloadingLive
+            v.activeDownloadFolder = folder.path
             writeBack(v, id: videoId)
-            let (ok, path, _, _, _) = await downloadVideo(url: v.url, label: v.label, tag: "LIVE", isLive: true, videoId: v.id, quality: v.quality ?? .best, meta: meta)
+            let (ok, path, _, _, _) = await downloadVideo(url: v.url, label: v.label, tag: "LIVE", isLive: true, videoId: v.id, quality: v.quality ?? .best, meta: meta, destination: folder)
+            v.activeDownloadFolder = nil
             v.liveDone = ok
             if let path { v.finalFilePath = path }
             v.status = ok ? .vodPending : .waiting
@@ -2864,6 +2948,7 @@ final class MonitorEngine: ObservableObject {
                 let finished = Date()
                 v.liveFinishedAt = finished
                 v.liveFilePath = path
+                if v.interruptedDownload?.kind == .live { v.interruptedDownload = nil }
                 v.vodWaitingSince = finished
                 v.vodWaitReason = "Waiting for YouTube to publish the VOD."
                 notify(title: "Live download complete", message: "\(v.label) — now waiting for the VOD version.")
@@ -2911,9 +2996,12 @@ final class MonitorEngine: ObservableObject {
                 v.vodNotified = true
             }
             if v.liveFilePath == nil { v.liveFilePath = liveRecordingPath(v) }
+            let folder = downloadFolder(for: v, kind: .vod)
             v.status = .downloadingVod
+            v.activeDownloadFolder = folder.path
             writeBack(v, id: videoId)
-            let (ok, path, formatId, qualityLabel, qualityConfirmed) = await downloadVideo(url: v.url, label: v.label, tag: "VOD", isLive: false, videoId: v.id, quality: v.quality ?? .best, meta: meta)
+            let (ok, path, formatId, qualityLabel, qualityConfirmed) = await downloadVideo(url: v.url, label: v.label, tag: "VOD", isLive: false, videoId: v.id, quality: v.quality ?? .best, meta: meta, destination: folder)
+            v.activeDownloadFolder = nil
             // Confirmed 10-10-2026 (Tiësto, Pinkpop 2004): heeftAdaptieveFormaten()
             // above checks whether the *format list* mentions high-quality tracks,
             // but that list can say yes before those tracks are actually fetchable
@@ -2941,6 +3029,7 @@ final class MonitorEngine: ObservableObject {
             v.status = ok ? .done : .vodPending
             v.vodWaitReason = ok ? nil : "The last VOD download attempt failed."
             if ok {
+                v.interruptedDownload = nil
                 v.qualityConfirmed = qualityConfirmed
                 v.vodVersion = DownloadedVersion.from(
                     meta: meta, formatId: formatId, qualityLabel: qualityLabel,
@@ -2992,7 +3081,7 @@ final class MonitorEngine: ObservableObject {
             // can briefly return nil right after a live capture (e.g. YouTube hasn't finished
             // processing the ended stream into a VOD yet), and resetting to .waiting here made
             // the row look like it hadn't started at all despite liveDone already being true.
-            if v.liveDone || v.status == .vodPending {
+            if v.liveDone || v.status == .vodPending || (v.interruptedDownload?.kind == .live && liveStatus == "post_live") {
                 v.status = .vodPending
                 v.vodWaitReason = "Waiting for YouTube to publish the VOD."
             } else {
