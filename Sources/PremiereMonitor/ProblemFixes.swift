@@ -14,6 +14,10 @@ enum ProblemFixes {
     static func fix(for key: String) -> ProblemFix? {
         let engine = MonitorEngine.shared
         switch key {
+        case "schedule-storage":
+            return ProblemFix(label: engine.scheduleStorageActionLabel, icon: "externaldrive") {
+                engine.resolveScheduleStorage()
+            }
         case "download-folder":
             return ProblemFix(label: "Open System Settings", icon: "gearshape") {
                 openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_DownloadsFolder")

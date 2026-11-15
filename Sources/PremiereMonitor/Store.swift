@@ -32,55 +32,71 @@ enum Store {
         return true
     }
 
-    /// Of load() een bestaand bestand niet kon lezen. Zolang dit aanstaat mag
-    /// save() niet schrijven — anders overschrijft de eerstvolgende actie
-    /// (zelfs een simpele "video toevoegen") je bestaande lijst met een lijst
-    /// van bijna niets. Dat gat bestond op 19-09-2026: een niet-optioneel veld
-    /// liet het decoderen mislukken, load() gaf stilzwijgend [] terug, en
-    /// alleen een toevallige `guard !videos.isEmpty` in de pollus voorkwam dat
-    /// de lege lijst automatisch werd weggeschreven. Een handmatige actie in
-    /// de UI had er wél doorheen gekund.
+    static let videosBackup = appSupportDir.appendingPathComponent("videos.json.backup")
     private(set) static var loadFailed = false
+    private(set) static var loadedBackup = false
 
-    static func load() -> [MonitoredVideo] {
-        guard let data = try? Data(contentsOf: videosFile) else {
-            return []          // bestand bestaat nog niet: gewoon een lege start
-        }
+    private static func decodeVideos(_ data: Data) throws -> [MonitoredVideo] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let videos = try? decoder.decode([MonitoredVideo].self, from: data) {
-            loadFailed = false
-            return videos
+        return try decoder.decode([MonitoredVideo].self, from: data)
+    }
+
+    private static func readIfPresent(_ url: URL) throws -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == NSFileReadNoSuchFileError {
+            return nil
+        }
+    }
+
+    static func load() -> [MonitoredVideo] {
+        loadFailed = false
+        loadedBackup = false
+        do {
+            if let data = try readIfPresent(videosFile) {
+                return try decodeVideos(data)
+            }
+            guard try readIfPresent(videosBackup) != nil else { return [] }
+        } catch {
+            appendLog("[Store] Could not read videos.json: \(error.localizedDescription)")
         }
 
-        // Het bestand bestaat en heeft inhoud, maar het decoderen mislukte.
-        // Dit is geen "geen video's" — dit is een fout die niet stil mag
-        // blijven. Eerst een kopie wegzetten zodat er niets verloren gaat,
-        // ook als er straks per ongeluk toch overheen geschreven wordt.
         loadFailed = true
-        let backup = videosFile.deletingLastPathComponent()
-            .appendingPathComponent("videos.json.corrupt-\(Int(Date().timeIntervalSince1970))")
-        try? data.write(to: backup)
-        appendLog("[Store] ❌ Could not read videos.json — original preserved as "
-                  + "\(backup.lastPathComponent). Saving is blocked until this is investigated.")
+        if let data = try? Data(contentsOf: videosBackup), let videos = try? decodeVideos(data) {
+            loadedBackup = true
+            return videos
+        }
         return []
     }
 
-    static func save(_ videos: [MonitoredVideo]) {
-        guard !loadFailed else {
-            appendLog("[Store] ⚠️ Save skipped: videos.json gave a read error earlier, "
-                      + "and I refuse to write a possibly-broken list over the real one.")
-            return
+    static func save(_ videos: [MonitoredVideo], restoringBackup: Bool = false) throws {
+        guard !loadFailed || (loadedBackup && restoringBackup) else {
+            throw CocoaError(.fileWriteNoPermission)
         }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(videos) else { return }
-        // .atomic: Foundation writes to a temp file next to the target and
-        // renames it into place, so a crash or power loss mid-write can never
-        // leave a half-written videos.json — you either get the old file or
-        // the new one, never something in between. Plain write(to:) doesn't
-        // give you that; it can be interrupted mid-write.
-        try? data.write(to: videosFile, options: .atomic)
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(videos)
+
+        if let previous = try readIfPresent(videosFile) {
+            if restoringBackup {
+                let preserved = appSupportDir.appendingPathComponent("videos.json.replaced-\(UUID().uuidString)")
+                try previous.write(to: preserved, options: .atomic)
+            } else {
+                // Only known-good data can replace the recovery copy.
+                _ = try decodeVideos(previous)
+                if previous != data {
+                    try previous.write(to: videosBackup, options: .atomic)
+                }
+            }
+        } else if try readIfPresent(videosBackup) == nil {
+            try data.write(to: videosBackup, options: .atomic)
+        }
+        try data.write(to: videosFile, options: .atomic)
+        loadFailed = false
+        loadedBackup = false
     }
 
     static func loadSettings() -> AppSettings {
@@ -140,9 +156,9 @@ enum Store {
         guard let entryData = entry.data(using: .utf8) else { return }
         if FileManager.default.fileExists(atPath: logFile.path) {
             if let handle = try? FileHandle(forWritingTo: logFile) {
-                handle.seekToEndOfFile()
-                handle.write(entryData)
-                try? handle.close()
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: entryData)
             }
         } else {
             try? entry.write(to: logFile, atomically: true, encoding: .utf8)

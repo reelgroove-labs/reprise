@@ -21,7 +21,21 @@ struct ContentView: View {
     private var scheduledVideos: [MonitoredVideo] {
         engine.videos
             .filter { $0.status != .done }
-            .sorted { $0.scheduledDate < $1.scheduledDate }
+            .sorted {
+                let left = schedulePriority($0.status)
+                let right = schedulePriority($1.status)
+                return left == right ? $0.scheduledDate < $1.scheduledDate : left < right
+            }
+    }
+
+    private func schedulePriority(_ status: VideoStatus) -> Int {
+        switch status {
+        case .downloadingLive: return 0
+        case .downloadingVod: return 1
+        case .waiting: return 2
+        case .vodPending: return 3
+        case .done: return 4
+        }
     }
 
     private var completedVideos: [MonitoredVideo] {
@@ -210,7 +224,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 0) {
                 pageHeader(
                     title: "Scheduled",
-                    subtitle: "Reprise watches your premieres and saves both the LIVE capture and final VOD."
+                    subtitle: "\(scheduledVideos.count) tracked · \(scheduledVideos.filter { $0.status == .downloadingLive || $0.status == .downloadingVod }.count) recording or downloading"
                 )
 
                 if !engine.permissionWarnings.isEmpty {
@@ -219,7 +233,7 @@ struct ContentView: View {
                 }
 
                 if let nextVideo = scheduledVideos.first {
-                    Text("NEXT PREMIERE")
+                    Text(focusHeading(for: nextVideo.status))
                         .sectionHeading()
 
                     NextPremiereCard(
@@ -233,7 +247,7 @@ struct ContentView: View {
                     )
 
                     if scheduledVideos.count > 1 {
-                        Text("UP NEXT")
+                        Text("Other premieres")
                             .sectionHeading()
                         VStack(spacing: 0) {
                             ForEach(Array(scheduledVideos.dropFirst())) { video in
@@ -258,7 +272,7 @@ struct ContentView: View {
                 }
 
                 if let completedVideo = completedVideos.first {
-                    Text("RECENTLY COMPLETED")
+                    Text("Recently completed")
                         .sectionHeading()
                     CompletedVideoRow(video: completedVideo) {
                         engine.revealFile(completedVideo)
@@ -272,6 +286,16 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Reprise")
+    }
+
+    private func focusHeading(for status: VideoStatus) -> String {
+        switch status {
+        case .downloadingLive: return "Recording now"
+        case .downloadingVod: return "Downloading now"
+        case .waiting: return "Next premiere"
+        case .vodPending: return "Waiting for VOD"
+        case .done: return "Completed"
+        }
     }
 
     private var incomingContent: some View {
@@ -323,7 +347,7 @@ struct ContentView: View {
                         ContentUnavailableView(
                             "Nothing new right now",
                             systemImage: "antenna.radiowaves.left.and.right",
-                            description: Text("Reprise checks watched channels once a day. Use Check now if you do not want to wait.")
+                            description: Text("Reprise checks watched channels on the interval set in Settings. Use Check now to refresh immediately.")
                         )
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 100)
@@ -399,14 +423,6 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if selectedSection == .scheduled {
-                Button {
-                    StatusItemController.shared?.showAddWindow()
-                } label: {
-                    Label("Add premiere", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-            }
         }
     }
 
@@ -549,23 +565,16 @@ private struct NextPremiereCard: View {
         video.scheduledDate.addingTimeInterval(-(checkLeadMinutes * 60))
     }
 
-    private var currentStep: Int {
-        switch video.status {
-        case .waiting: return 1
-        case .downloadingLive: return 2
-        case .vodPending, .downloadingVod: return 3
-        case .done: return 4
-        }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 14) {
-                VideoThumbnail(video: video, width: 98, height: 55)
+            HStack(alignment: .top, spacing: 16) {
+                VideoThumbnail(video: video, width: 116, height: 65)
                 VStack(alignment: .leading, spacing: 5) {
                     Text(video.label)
-                        .font(.headline)
+                        .font(.title3.weight(.semibold))
                         .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
                         Label(video.scheduledDate.formatted(date: .abbreviated, time: .shortened), systemImage: "calendar")
                         if let quality = video.quality, quality != .best {
@@ -578,14 +587,14 @@ private struct NextPremiereCard: View {
                 Spacer(minLength: 12)
                 VStack(alignment: .trailing, spacing: 5) {
                     StatusBadge(status: video.status)
-                    if video.status == .waiting {
-                        Text("in \(video.scheduledDate, style: .relative)")
-                            .font(.caption)
+                    if video.status == .waiting, video.scheduledDate > Date() {
+                        Text(video.scheduledDate, style: .relative)
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
-                    } else if let progress = engine.downloadProgress[video.id] {
+                    } else if isBusy, let progress = engine.downloadProgress[video.id] {
                         Text(progress)
-                            .font(.caption)
-                            .foregroundStyle(StatusBadge.color(for: video.status))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
                 }
                 Menu {
@@ -607,46 +616,45 @@ private struct NextPremiereCard: View {
                 .accessibilityLabel("Actions for \(video.label)")
             }
 
-            Divider()
-                .padding(.vertical, 18)
-
-            HStack(alignment: .top, spacing: 0) {
-                LifecycleStep(
-                    title: "Verified",
-                    detail: "link, access and space",
-                    state: currentStep >= 1 ? .complete : .pending
-                )
-                LifecycleConnector(active: currentStep >= 2)
-                LifecycleStep(
-                    title: "Monitoring",
-                    detail: "\(monitoringDate.formatted(date: .omitted, time: .shortened))",
-                    state: currentStep == 1 ? .active : currentStep > 1 ? .complete : .pending
-                )
-                LifecycleConnector(active: currentStep >= 3)
-                LifecycleStep(
-                    title: "Capture LIVE",
-                    detail: "from the beginning",
-                    state: currentStep == 2 ? .active : currentStep > 2 ? .complete : .pending
-                )
-                LifecycleConnector(active: currentStep >= 4)
-                LifecycleStep(
-                    title: "Save VOD",
-                    detail: "final full version",
-                    state: currentStep >= 3 ? (currentStep == 4 ? .complete : .active) : .pending
-                )
+            if video.status == .vodPending {
+                Divider().padding(.vertical, 14)
+                VodWaitingDetails(video: video)
+            } else if video.status == .waiting {
+                Divider().padding(.vertical, 14)
+                HStack(spacing: 12) {
+                    if monitoringDate > Date() {
+                        Label("Monitoring starts \(monitoringDate.formatted(date: .omitted, time: .shortened))",
+                              systemImage: "clock")
+                    } else {
+                        Label("Monitoring for the live broadcast", systemImage: "antenna.radiowaves.left.and.right")
+                    }
+                    Spacer()
+                    Button("Check now", action: onCheckNow)
+                        .controlSize(.small)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .padding(.bottom, 2)
         }
         .padding(18)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+        .background(.background, in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(StatusBadge.color(for: video.status).opacity(isBusy ? 0.42 : 0.18))
+        }
     }
 }
 
 private struct ScheduledVideoRow: View {
+    @ObservedObject private var engine = MonitorEngine.shared
     let video: MonitoredVideo
     let onCheckNow: () -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
+
+    private var isBusy: Bool {
+        video.status == .downloadingLive || video.status == .downloadingVod
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -658,14 +666,21 @@ private struct ScheduledVideoRow: View {
                 Text(video.scheduledDate.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if video.status == .vodPending {
+                    VodWaitingDetails(video: video)
+                } else if isBusy, let progress = engine.downloadProgress[video.id] {
+                    Text(progress)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
             StatusBadge(status: video.status)
             Menu {
-                Button("Check now", action: onCheckNow)
-                Button("Edit premiere", action: onEdit)
+                Button("Check now", action: onCheckNow).disabled(isBusy)
+                Button("Edit premiere", action: onEdit).disabled(isBusy)
                 Divider()
-                Button("Remove premiere", role: .destructive, action: onDelete)
+                Button("Remove premiere", role: .destructive, action: onDelete).disabled(isBusy)
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 24, height: 24)
@@ -674,6 +689,44 @@ private struct ScheduledVideoRow: View {
             .accessibilityLabel("Actions for \(video.label)")
         }
         .padding(.vertical, 10)
+    }
+}
+
+private struct VodWaitingDetails: View {
+    @ObservedObject private var engine = MonitorEngine.shared
+    let video: MonitoredVideo
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            VStack(alignment: .leading, spacing: 5) {
+                Text(video.vodWaitReason ?? "Waiting for YouTube to publish the VOD.")
+                if let next = engine.nextVodCheck(video), next > context.date {
+                    Text("Next check around \(next.formatted(date: .omitted, time: .shortened))")
+                } else {
+                    Text("Next check shortly")
+                }
+                if let livePath = engine.liveRecordingPath(video) {
+                    Button("Show LIVE recording in Finder") {
+                        engine.revealLiveRecording(video)
+                    }
+                    .help(livePath)
+                } else if video.liveDone {
+                    Text("LIVE recording could not be located.")
+                }
+                if let availableAt = engine.vodFallbackAvailableAt(video) {
+                    if availableAt <= context.date {
+                        Button("Download available version") {
+                            engine.downloadAvailableVod(video)
+                        }
+                        .help("Save the available VOD even if higher-quality formats are still processing")
+                    } else {
+                        Text("Available-version option at \(availableAt.formatted(date: .omitted, time: .shortened))")
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -697,7 +750,7 @@ private struct CompletedVideoRow: View {
                     .font(.body.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 7) {
-                    Label("LIVE + VOD", systemImage: "checkmark.circle.fill")
+                    Label(video.liveDone ? "LIVE + VOD" : "VOD", systemImage: "checkmark.circle.fill")
                     if let fileSizeText { Text(fileSizeText) }
                 }
                 .font(.caption)
@@ -726,7 +779,7 @@ private struct CompletedVideoRow: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
             Button("Show in Finder", action: onReveal)
@@ -802,7 +855,8 @@ private struct VideoThumbnail: View {
             }
         }
         .frame(width: width, height: height)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityHidden(true)
     }
 }
 
@@ -812,10 +866,13 @@ private struct StatusBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: icon(for: status))
+                .foregroundStyle(Self.color(for: status))
+                .accessibilityHidden(true)
             Text(status.displayName)
         }
-        .font(.caption)
-        .foregroundStyle(Self.color(for: status))
+        .font(.caption.weight(.semibold))
+        .fixedSize(horizontal: true, vertical: false)
+        .foregroundStyle(.primary)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(Self.color(for: status).opacity(0.12), in: Capsule())
@@ -839,54 +896,6 @@ private struct StatusBadge: View {
         case .downloadingVod: return "arrow.down.circle"
         case .done: return "checkmark.circle.fill"
         }
-    }
-}
-
-private struct LifecycleStep: View {
-    enum State: Equatable { case complete, active, pending }
-
-    let title: String
-    let detail: String
-    let state: State
-
-    private var color: Color {
-        switch state {
-        case .complete: return .green
-        case .active: return .blue
-        case .pending: return .secondary
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Circle()
-                .fill(color)
-                .frame(width: 10, height: 10)
-                .overlay {
-                    if state == .active {
-                        Circle().stroke(color.opacity(0.22), lineWidth: 6)
-                    }
-                }
-            Text(title)
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-            Text(detail)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct LifecycleConnector: View {
-    let active: Bool
-
-    var body: some View {
-        Capsule()
-            .fill(active ? Color.green.opacity(0.45) : Color.secondary.opacity(0.18))
-            .frame(width: 20, height: 1)
-            .padding(.top, 5)
     }
 }
 

@@ -89,6 +89,11 @@ final class MonitorEngine: ObservableObject {
         for v in videos {
             log("Loaded: [\(v.label)] scheduled \(v.scheduledDate.formatted(date: .abbreviated, time: .standard)), status=\(v.status.displayName)")
         }
+        if Store.loadFailed {
+            permissionWarnings["schedule-storage"] = Store.loadedBackup
+                ? "Reprise loaded the recovery copy. Save it to restore the schedule on disk."
+                : "Reprise could not read the schedule. Check the files in Application Support."
+        }
         startLoop()          // tick() draait meteen, en checkt daarbinnen ook yt-dlp
     }
 
@@ -435,7 +440,7 @@ final class MonitorEngine: ObservableObject {
     private func checkExternalTools(silent: Bool = false) {
         var missing: [String] = []
         if !FileManager.default.isExecutableFile(atPath: ytDlpPath) { missing.append("yt-dlp") }
-        if ffmpegPath == nil { missing.append("ffmpeg") }
+        if ffmpegPath == nil || ffprobePath == nil { missing.append("ffmpeg") }
 
         guard !missing.isEmpty else {
             permissionWarnings["external-tools"] = nil
@@ -463,7 +468,7 @@ final class MonitorEngine: ObservableObject {
     func installMissingTools() {
         var missing: [String] = []
         if !FileManager.default.isExecutableFile(atPath: ytDlpPath) { missing.append("yt-dlp") }
-        if ffmpegPath == nil { missing.append("ffmpeg") }
+        if ffmpegPath == nil || ffprobePath == nil { missing.append("ffmpeg") }
         guard !missing.isEmpty else { return }
 
         guard let brew = brewPath else {
@@ -699,11 +704,40 @@ final class MonitorEngine: ObservableObject {
         Store.appendLog(line)
     }
 
+    private func saveSchedule(restoringBackup: Bool = false) {
+        if Store.loadFailed && !restoringBackup { return }
+        do {
+            try Store.save(videos, restoringBackup: restoringBackup)
+            permissionWarnings["schedule-storage"] = nil
+        } catch {
+            let message = "The schedule could not be saved. Changes are only in memory. \(error.localizedDescription)"
+            if permissionWarnings["schedule-storage"] != message {
+                log("[Store] \(message)")
+            }
+            permissionWarnings["schedule-storage"] = message
+        }
+    }
+
+    var scheduleStorageActionLabel: String {
+        if Store.loadedBackup { return "Restore schedule" }
+        return Store.loadFailed ? "Open schedule folder" : "Retry saving"
+    }
+
+    func resolveScheduleStorage() {
+        if Store.loadFailed && !Store.loadedBackup {
+            NSWorkspace.shared.open(Store.appSupportDir)
+        } else {
+            saveSchedule(restoringBackup: Store.loadedBackup)
+        }
+    }
+
     /// Adds a premiere. Returns false (and adds nothing) if the URL is already in the list.
     @discardableResult
     func addVideo(url: String, label: String, scheduledDate: Date, quality: VideoQuality = .best, downloadAltPremiumCodec: Bool = false) -> Bool {
         let trimmedUrl = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if videos.contains(where: { $0.url.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedUrl }) {
+        let videoID = extractYouTubeID(from: trimmedUrl)
+        if videos.contains(where: { $0.url.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedUrl
+            || (videoID != nil && $0.youtubeID == videoID) }) {
             log("Not added (already in the list): \(trimmedUrl)")
             return false
         }
@@ -711,14 +745,15 @@ final class MonitorEngine: ObservableObject {
         var v = MonitoredVideo(url: trimmedUrl, label: trimmedLabel.isEmpty ? trimmedUrl : trimmedLabel, scheduledDate: scheduledDate, quality: quality)
         v.downloadAltPremiumCodec = downloadAltPremiumCodec
         videos.append(v)
-        Store.save(videos)
+        saveSchedule()
         log("Added: \(v.label)")
         return true
     }
 
     func removeVideo(_ video: MonitoredVideo) {
         videos.removeAll { $0.id == video.id }
-        Store.save(videos)
+        lastVodCheck[video.id] = nil
+        saveSchedule()
         log("Removed: \(video.label)")
     }
 
@@ -738,12 +773,13 @@ final class MonitorEngine: ObservableObject {
         log("Now watching channel: \(trimmed)")
         // Check it right away rather than making the user wait up to a day to find out
         // whether the URL was even valid.
-        Task { await checkChannels(force: true) }
+        if let channel = channels.last { checkChannelNow(channel) }
         return true
     }
 
     func removeChannel(_ channel: TrackedChannel) {
         channels.removeAll { $0.id == channel.id }
+        channelAttempts[channel.id] = nil
         discoveredVideos.removeAll { $0.channelId == channel.id }
         Store.saveChannels(channels)
         Store.saveDiscovered(discoveredVideos)
@@ -763,45 +799,35 @@ final class MonitorEngine: ObservableObject {
         Store.saveDiscovered(discoveredVideos)
     }
 
-    private var lastChannelCheck: Date?
+    private var channelAttempts: [UUID: Date] = [:]
 
-    /// Once a day (or immediately after adding a channel, via `force`): asks yt-dlp for
-    /// each watched channel's "streams" tab — the one YouTube tab that lists live AND
-    /// upcoming broadcasts together, each already tagged with a `live_status` — so this
-    /// is one flat-playlist request per channel, not one lookup per video. Confirmed
-    /// 01-10-2026 against a 585-video channel: fast, and `live_status` comes back
-    /// populated even in flat-playlist mode for this specific tab.
-    ///
-    /// A channel with nothing live or upcoming right now has *no* streams tab at all —
-    /// yt-dlp then exits non-zero with "This channel does not have a streams tab", which
-    /// is treated as "0 upcoming", not a failure.
-    func checkChannels(force: Bool = false) async {
-        if !force, let last = lastChannelCheck, Date().timeIntervalSince(last) < 86400 { return }
-        lastChannelCheck = Date()
-        guard !channels.isEmpty else { return }
-
-        for index in channels.indices {
-            await checkOneChannel(index: index)
-        }
+    func setAutomaticScheduling(_ enabled: Bool, channelID: UUID) {
+        guard let index = channels.firstIndex(where: { $0.id == channelID }) else { return }
+        channels[index].automaticallySchedules = enabled
         Store.saveChannels(channels)
-        Store.saveDiscovered(discoveredVideos)
+        if enabled { checkChannelNow(channels[index]) }
     }
 
-    /// Checks a single channel right away, bypassing the once-a-day throttle — the
-    /// Channels settings tab's per-row "check now" button (01-10-2026), for when you
-    /// don't want to wait up to a day to find out if a just-watched channel has
-    /// anything new.
-    func checkChannelNow(_ channel: TrackedChannel) {
-        guard let index = channels.firstIndex(where: { $0.id == channel.id }) else { return }
-        Task {
-            await checkOneChannel(index: index)
-            Store.saveChannels(channels)
-            Store.saveDiscovered(discoveredVideos)
+    private var checkingChannels: Set<UUID> = []
+
+    func checkChannels(force: Bool = false) async {
+        let now = Date()
+        let due = channels.filter { channel in
+            let last = channelAttempts[channel.id] ?? channel.lastChecked ?? .distantPast
+            return force || now.timeIntervalSince(last) >= settings.channelCheckInterval
         }
+        for channel in due { await checkOneChannel(id: channel.id) }
     }
 
-    private func checkOneChannel(index: Int) async {
-        let channel = channels[index]
+    func checkChannelNow(_ channel: TrackedChannel) {
+        Task { await checkOneChannel(id: channel.id) }
+    }
+
+    private func checkOneChannel(id: UUID) async {
+        guard let channel = channels.first(where: { $0.id == id }),
+              checkingChannels.insert(id).inserted else { return }
+        defer { checkingChannels.remove(id) }
+        channelAttempts[id] = Date()
         let base = channel.url.hasSuffix("/") ? String(channel.url.dropLast()) : channel.url
         // /videos, not /streams: found 15-10-2026 (user report — a real upcoming premiere,
         // visible and clearly marked "Gepland" in the YouTube app, was silently missed).
@@ -813,6 +839,7 @@ final class MonitorEngine: ObservableObject {
         // live_status "is_upcoming" — confirmed directly against this exact channel/video.
         let videosUrl = base + "/videos"
         let (_, out, err) = await runProcess(ytDlpPath, ["--flat-playlist", "-J", videosUrl])
+        guard let index = channels.firstIndex(where: { $0.id == id }) else { return }
 
         guard let data = out.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -820,6 +847,7 @@ final class MonitorEngine: ObservableObject {
                 log("⚠️ Could not check channel \(channel.name ?? channel.url): \(tail(err))")
             } else {
                 channels[index].lastChecked = Date()
+                Store.saveChannels(channels)
             }
             return
         }
@@ -832,31 +860,61 @@ final class MonitorEngine: ObservableObject {
         let upcomingIDs = Set(upcoming.compactMap { $0["id"] as? String })
 
         let newIDs = upcomingIDs.subtracting(channels[index].knownUpcomingIDs)
-        for entry in upcoming where newIDs.contains(entry["id"] as? String ?? "") {
-            guard let videoID = entry["id"] as? String else { continue }
+        let existing = discoveredVideos.filter { $0.channelId == id }
+        var processed: Set<String> = []
+        var discoveries: [DiscoveredVideo] = []
+        for entry in upcoming {
+            guard let videoID = entry["id"] as? String, processed.insert(videoID).inserted else { continue }
+            let previous = existing.first { $0.videoID == videoID }
+            guard newIDs.contains(videoID) || previous != nil else { continue }
+            if videos.contains(where: { $0.youtubeID == videoID }) && previous == nil { continue }
             let title = entry["title"] as? String ?? videoID
             // The fast channel listing tells us that something is upcoming but normally
             // omits the scheduled timestamp. Fetch details only for a genuinely new
             // discovery, keeping regular channel checks fast while giving Incoming the
             // two dates that make it useful: when it was found and when it will air.
             let scheduledDate: Date?
-            if let dateFromListing = premiereDate(in: entry) {
-                scheduledDate = dateFromListing
+            if let knownDate = premiereDate(in: entry) ?? previous?.scheduledDate {
+                scheduledDate = knownDate
             } else {
                 scheduledDate = await scheduledPremiereDate(for: videoID)
             }
-            discoveredVideos.append(DiscoveredVideo(
+            guard channels.contains(where: { $0.id == id }) else { return }
+            discoveries.append(DiscoveredVideo(
                 videoID: videoID, title: title,
-                channelName: channels[index].name ?? channel.url,
+                channelName: (json["channel"] as? String) ?? channel.name ?? channel.url,
                 channelId: channel.id,
-                discoveredAt: Date(),
+                discoveredAt: previous?.discoveredAt ?? Date(),
                 scheduledDate: scheduledDate
             ))
             let schedule = scheduledDate.map { " — premieres \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-            log("📡 New premiere found on \(channels[index].name ?? channel.url): \(title)\(schedule)")
+            if previous == nil {
+                log("📡 New premiere found on \(channel.name ?? channel.url): \(title)\(schedule)")
+            }
         }
-        channels[index].knownUpcomingIDs = Array(upcomingIDs)
-        channels[index].lastChecked = Date()
+        guard let currentIndex = channels.firstIndex(where: { $0.id == id }) else { return }
+        for discovery in discoveries {
+            if channels[currentIndex].automaticallySchedules == true,
+               let date = discovery.scheduledDate, !Store.loadFailed {
+                addVideo(url: discovery.url, label: discovery.title, scheduledDate: date,
+                         quality: settings.defaultQualityResolved)
+                if permissionWarnings["schedule-storage"] == nil {
+                    discoveredVideos.removeAll { $0.videoID == discovery.videoID }
+                    continue
+                }
+            }
+            if let existingIndex = discoveredVideos.firstIndex(where: { $0.videoID == discovery.videoID }) {
+                if discoveredVideos[existingIndex].channelId == id {
+                    discoveredVideos[existingIndex] = discovery
+                }
+            } else {
+                discoveredVideos.append(discovery)
+            }
+        }
+        channels[currentIndex].knownUpcomingIDs = Array(upcomingIDs)
+        channels[currentIndex].lastChecked = Date()
+        Store.saveChannels(channels)
+        Store.saveDiscovered(discoveredVideos)
     }
 
     /// Read the release time from either a channel-listing entry or a full video
@@ -884,7 +942,7 @@ final class MonitorEngine: ObservableObject {
         let removed = videos.filter { $0.status == .done }.count
         guard removed > 0 else { return }
         videos.removeAll { $0.status == .done }
-        Store.save(videos)
+        saveSchedule()
         log("Cleared \(removed) completed premiere(s) from the list.")
     }
 
@@ -935,6 +993,10 @@ final class MonitorEngine: ObservableObject {
             // live portion already ended however long ago the *old* video's did,
             // skipping the wait it should actually be doing for the new one.
             v.liveFinishedAt = nil
+            v.liveFilePath = nil
+            v.vodWaitingSince = nil
+            v.vodWaitReason = nil
+            lastVodCheck[id] = nil
         } else if dateChanged {
             // Same video, new time: let the pre-flight pushes fire again for the new date.
             v.dayBeforeCheckNotified = nil
@@ -942,7 +1004,7 @@ final class MonitorEngine: ObservableObject {
         }
 
         videos[index] = v
-        Store.save(videos)
+        saveSchedule()
         log("Updated: \(v.label)" + (urlChanged ? " (URL changed — tracking state reset)" : "")
             + (dateChanged ? " (rescheduled — pre-flight checks will fire again)" : ""))
         return true
@@ -950,17 +1012,43 @@ final class MonitorEngine: ObservableObject {
 
     /// Forces an immediate check for this premiere, regardless of the check window.
     func checkNow(_ video: MonitoredVideo) {
-        guard let index = videos.firstIndex(where: { $0.id == video.id }) else { return }
         log("[\(video.label)] Manual check started...")
         Task {
+            guard let index = videos.firstIndex(where: { $0.id == video.id }) else { return }
             await self.checkOneVideo(index: index, forceCheck: true)
-            Store.save(self.videos)
         }
     }
 
-    /// Runs the same yt-dlp/access/disk-space/link check as the automatic 24h/1h
-    /// pre-flight push, on demand — doesn't touch dayBeforeCheckNotified /
-    /// hourBeforeCheckNotified, so using this never skips or delays the automatic ones.
+    func vodFallbackAvailableAt(_ video: MonitoredVideo) -> Date? {
+        guard video.status == .vodPending else { return nil }
+        return (video.vodWaitingSince ?? video.liveFinishedAt)?.addingTimeInterval(settings.vodFallbackInterval)
+    }
+
+    func nextVodCheck(_ video: MonitoredVideo) -> Date? {
+        guard video.status == .vodPending else { return nil }
+        return lastVodCheck[video.id]?.addingTimeInterval(vodWaitInterval)
+    }
+
+    func revealLiveRecording(_ video: MonitoredVideo) {
+        guard let path = liveRecordingPath(video) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    func liveRecordingPath(_ video: MonitoredVideo) -> String? {
+        let legacyPath = video.liveDone && !video.vodDone ? video.finalFilePath : nil
+        guard let path = video.liveFilePath ?? legacyPath,
+              FileManager.default.isReadableFile(atPath: path) else { return nil }
+        return path
+    }
+
+    func downloadAvailableVod(_ video: MonitoredVideo) {
+        Task {
+            guard let index = videos.firstIndex(where: { $0.id == video.id }),
+                  let availableAt = vodFallbackAvailableAt(videos[index]), availableAt <= Date() else { return }
+            await checkOneVideo(index: index, forceCheck: true, acceptAvailableVod: true)
+        }
+    }
+
     func runPreflightCheckNow(_ video: MonitoredVideo) {
         log("[\(video.label)] Manual pre-flight check started...")
         Task {
@@ -1000,7 +1088,7 @@ final class MonitorEngine: ObservableObject {
     private func startLoop() {
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.tick()
+                self?.tick()
                 try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
             }
         }
@@ -1068,109 +1156,90 @@ final class MonitorEngine: ObservableObject {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: path)
             process.arguments = args
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-
-            // Raw, complete accumulation alongside stderrData below — independent of
-            // stdoutBuffer's line-splitting (which exists purely to feed
-            // processDownloadLine for live UI updates, and can reorder/drop \r-redrawn
-            // progress lines that don't matter for that). Used to write out the full,
-            // unprocessed yt-dlp transcript for a completed download (see
-            // downloadVideo's .ytdlp.log) — added 16-10-2026 on request: "echt vanaf de
-            // start tot het laatste", not the curated subset the app's own Log panel
-            // already shows.
-            var stdoutData = Data()
-            var stdoutBuffer = ""
-            outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                stdoutData.append(data)
-                guard let chunk = String(data: data, encoding: .utf8) else { return }
-                stdoutBuffer += chunk
-                // Live captures (--live-from-start) turned out — confirmed 04-10-2026
-                // with two separate real live streams, neither of which ever spawned
-                // ffmpeg despite --hls-prefer-ffmpeg — to go through yt-dlp's own
-                // "dashsegments"/hlsnative downloader instead. Its per-fragment
-                // progress line is redrawn in place with \r, not terminated with \n
-                // like every other yt-dlp output line, so it sat in stdoutBuffer
-                // forever and processDownloadLine() — which already parses
-                // "(frag N)" correctly via fragmentStand() — never saw it. Splitting
-                // on \r too is what the earlier stderr/ffmpeg fix should have been.
-                while let range = stdoutBuffer.rangeOfCharacter(from: CharacterSet(charactersIn: "\r\n")) {
-                    let line = String(stdoutBuffer[stdoutBuffer.startIndex..<range.lowerBound])
-                    stdoutBuffer.removeSubrange(stdoutBuffer.startIndex..<range.upperBound)
-                    Task { @MainActor in
-                        self?.processDownloadLine(line, videoId: videoId)
-                    }
-                }
-            }
-
-            var stderrData = Data()
-            var stderrBuffer = ""
-            errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                guard !data.isEmpty else { return }
-                stderrData.append(data)
-                // --hls-prefer-ffmpeg (used for live captures) hands the actual
-                // downloading to ffmpeg as yt-dlp's own subprocess, and ffmpeg's
-                // progress never looked like yt-dlp's "[download] X%" stdout lines at
-                // all — it's an entirely different format, on stderr, redrawn in
-                // place with \r instead of one line per \n. processDownloadLine
-                // (stdout-only) never saw any of it, so downloadProgress just sat on
-                // its initial "0%" placeholder for the whole capture — confirmed
-                // 04-10-2026, a screenshot showing 0% still unchanged after ~90
-                // minutes of a live recording. Parsed here instead.
-                guard let chunk = String(data: data, encoding: .utf8) else { return }
-                stderrBuffer += chunk
-                while let range = stderrBuffer.rangeOfCharacter(from: CharacterSet(charactersIn: "\r\n")) {
-                    let line = String(stderrBuffer[stderrBuffer.startIndex..<range.lowerBound])
-                    stderrBuffer.removeSubrange(stderrBuffer.startIndex..<range.upperBound)
-                    Task { @MainActor in
-                        guard let tijd = self?.ffmpegOpnameTijd(line) else { return }
-                        self?.downloadProgress[videoId] = tijd
-                        // Also into the visible Log panel, not just the row's small
-                        // progress text — same 3-second throttle as yt-dlp's own
-                        // progress lines use, so a 90-minute capture doesn't flood it
-                        // (user feedback, 04-10-2026: the log showed nothing at all
-                        // for the whole live capture, just silence between the
-                        // pre-live "Check:" lines and the eventual completion).
-                        self?.echoNaarLog(tijd, videoId: videoId, isVoortgang: true)
-                    }
-                }
-            }
-
-            process.terminationHandler = { proc in
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                let out = String(data: stdoutData, encoding: .utf8) ?? ""
-                let err = String(data: stderrData, encoding: .utf8) ?? ""
-                continuation.resume(returning: (proc.terminationStatus, out, err))
-            }
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
 
             do {
                 try process.run()
             } catch {
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                continuation.resume(returning: (-1, "", "\(error)"))
+                continuation.resume(returning: (-1, "", String(describing: error)))
+                return
+            }
+
+            let readers = DispatchGroup()
+            let output = DownloadOutput()
+            for (pipe, isError) in [(stdout, false), (stderr, true)] {
+                DispatchQueue.global(qos: .userInitiated).async(group: readers) { [weak self] in
+                    let handle = pipe.fileHandleForReading
+                    var transcript = Data()
+                    var pendingLine = Data()
+                    while true {
+                        let chunk = handle.availableData
+                        guard !chunk.isEmpty else { break }
+                        transcript.append(chunk)
+                        for byte in chunk {
+                            if byte == 10 || byte == 13 {
+                                guard !pendingLine.isEmpty else { continue }
+                                let line = String(decoding: pendingLine, as: UTF8.self)
+                                pendingLine.removeAll(keepingCapacity: true)
+                                DispatchQueue.main.async { [weak self] in
+                                    if isError {
+                                        guard let time = self?.ffmpegOpnameTijd(line) else { return }
+                                        self?.downloadProgress[videoId] = time
+                                        self?.echoNaarLog(time, videoId: videoId, isVoortgang: true)
+                                    } else {
+                                        self?.processDownloadLine(line, videoId: videoId)
+                                    }
+                                }
+                            } else {
+                                pendingLine.append(byte)
+                            }
+                        }
+                    }
+                    output.store(String(decoding: transcript, as: UTF8.self), isError: isError)
+                }
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async(group: readers) {
+                process.waitUntilExit()
+            }
+            readers.notify(queue: .main) {
+                continuation.resume(returning: (process.terminationStatus, output.stdout, output.stderr))
             }
         }
     }
 
-    private var lastCapturedFilePath: [UUID: String] = [:]
-    private var lastCapturedFormatId: [UUID: String] = [:]
-    private var lastCapturedFormatNote: [UUID: String] = [:]
+    private final class DownloadOutput: @unchecked Sendable {
+        private let lock = NSLock()
+        private var streams = ["", ""]
 
-    /// ffmpeg's own stderr progress line (used via --hls-prefer-ffmpeg for live
-    /// captures) looks like:
-    ///   frame= 1234 fps=25 q=-1.0 size=  512000kB time=00:12:34.56 bitrate=... speed=1.0x
-    /// A percentage is meaningless here regardless (the total length of a live
-    /// stream isn't knowable in advance, same reasoning as the VOD-vs-live split
-    /// elsewhere in this file) — but elapsed recording time is both knowable and
-    /// actually useful, so that's shown instead of leaving the row stuck on its
-    /// initial "0%" for the entire capture.
+        func store(_ value: String, isError: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            streams[isError ? 1 : 0] = value
+        }
+
+        var stdout: String { read(at: 0) }
+        var stderr: String { read(at: 1) }
+
+        private func read(at index: Int) -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return streams[index]
+        }
+    }
+
+    private func downloadResult(in stdout: String) -> (path: String?, formatId: String?, note: String?) {
+        func value(_ prefix: String) -> String? {
+            stdout.split(whereSeparator: \.isNewline)
+                .last(where: { $0.hasPrefix(prefix) })
+                .map { String($0.dropFirst(prefix.count)) }
+        }
+        return (value("REPRISE_PATH:"), value("REPRISE_FORMAT:"), value("REPRISE_NOTE:"))
+    }
+
     private func ffmpegOpnameTijd(_ line: String) -> String? {
         guard let re = try? NSRegularExpression(pattern: "time=(\\d+):(\\d\\d):(\\d\\d)"),
               let m = re.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
@@ -1241,80 +1310,92 @@ final class MonitorEngine: ObservableObject {
     /// is het geslaagd; liggen beeld en geluid nog los, dan voegen we ze hier
     /// alsnog samen. Geeft het uiteindelijke pad terug, of nil als er niets
     /// bruikbaars staat.
-    private func reddenNaFout(url: String, tag: String, label: String) async -> String? {
-        guard let vid = extractYouTubeID(from: url) else { return nil }
-        let fm = FileManager.default
-        guard let alles = try? fm.contentsOfDirectory(atPath: downloadRoot.path) else { return nil }
-
-        // Bewust niet filteren op .mkv of op vaste formaatnummers: yt-dlp kiest
-        // per video wat het beste past. De live-opname van 19-09-2026 kwam
-        // binnen als .f137.mkv + .f140.mkv, maar dezelfde video als VOD werd
-        // .f137.mp4 + .f251.webm. Filteren op ".mkv" of op ".f14" had die dus
-        // gemist — en juist die moest gered worden.
-        let mediaExt = ["mkv", "mp4", "webm", "m4a"]
-        let pad = { (naam: String) in self.downloadRoot.appendingPathComponent(naam).path }
-        let grootte = { (naam: String) -> Int64 in
-            ((try? fm.attributesOfItem(atPath: pad(naam)))?[.size] as? Int64) ?? 0
-        }
-        let vanDitItem = alles.filter {
-            $0.contains(vid) && $0.contains("[\(tag)]")
-                && mediaExt.contains(($0 as NSString).pathExtension.lowercased())
-                && grootte($0) > 5_000_000          // halve downloads tellen niet mee
-        }
-
-        // Een losse track heet "… .f137.mp4"; zonder dat stuk is het al
-        // samengevoegd en zijn we klaar.
-        let isLosseTrack = { (naam: String) in
-            naam.range(of: "\\.f\\d+\\.[a-z0-9]+$", options: .regularExpression) != nil
-        }
-        if let klaar = vanDitItem.first(where: { !isLosseTrack($0) }) {
-            log("[\(label)] Stream ended, but the file is fully there.")
-            // Any other loose per-format files for this same item are yt-dlp's own
-            // intermediates that it normally deletes itself after a clean merge —
-            // it doesn't get the chance to when it exits with an error code first
-            // (the exact situation this function exists for), leaving multi-GB
-            // .f137/.f140/.f251 files behind forever (user feedback, 03-10-2026,
-            // screenshots from two different Macs both showing this). Safe to
-            // clear here specifically because we've just confirmed the real,
-            // complete file already exists — the merge branch below is separately
-            // careful to only ever delete the two files it itself just combined.
-            for naam in vanDitItem where isLosseTrack(naam) {
-                try? fm.removeItem(atPath: pad(naam))
-            }
-            return pad(klaar)
-        }
-
-        // Beeld en geluid uit elkaar houden op grootte in plaats van op
-        // formaatnummer: het beeldspoor is altijd vele malen groter.
-        let tracks = vanDitItem.filter(isLosseTrack).sorted { grootte($0) > grootte($1) }
-        guard tracks.count >= 2, let v = tracks.first, let a = tracks.last, v != a else { return nil }
-
-        // "… [LIVE].f137.mp4" → "… [LIVE].mkv": mkv slikt elke combinatie.
-        let doelNaam = v.replacingOccurrences(of: "\\.f\\d+\\.[a-z0-9]+$", with: ".mkv",
-                                              options: .regularExpression)
-        let doel = pad(doelNaam)
-        log("[\(label)] Stream ended before merging — merging video and audio myself…")
-        guard let ffmpeg = ffmpegPath else {
-            log("[\(label)] No ffmpeg found — video and audio remain as separate files.")
-            return nil
-        }
-        // Through runProcess (off the main thread) — a multi-GB merge used to block the UI.
-        let (rc, _, err) = await runProcess(ffmpeg, ["-v", "error", "-y", "-i", pad(v), "-i", pad(a),
-                                                     "-c", "copy", "-map", "0:v:0", "-map", "1:a:0", doel])
-        guard rc == 0, fm.fileExists(atPath: doel) else {
-            log("[\(label)] Merge failed (ffmpeg exited \(rc))\(err.isEmpty ? "" : ": \(tail(err))").")
-            return nil
-        }
-        log("[\(label)] Merged → \(doel)")
-        // Only the two sources we just combined — not a broader sweep of
-        // whatever else matches this item, since an unrelated loose file
-        // could still be another attempt's only surviving copy.
-        try? fm.removeItem(atPath: pad(v))
-        try? fm.removeItem(atPath: pad(a))
-        return doel
+    private func recordingStreams(at path: String) async -> Set<String> {
+        guard FileManager.default.isReadableFile(atPath: path),
+              let ffprobePath else { return [] }
+        let (status, output, _) = await runProcess(ffprobePath, [
+            "-v", "error", "-read_intervals", "%+5", "-count_packets",
+            "-show_entries", "stream=codec_type,nb_read_packets:stream_disposition=attached_pic",
+            "-of", "json", path
+        ])
+        guard status == 0,
+              let json = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+              let streams = json["streams"] as? [[String: Any]] else { return [] }
+        return Set(streams.compactMap { stream in
+            let disposition = stream["disposition"] as? [String: Int]
+            guard disposition?["attached_pic"] != 1,
+                  let count = (stream["nb_read_packets"] as? String).flatMap(Int.init),
+                  count > 0 else { return nil }
+            return stream["codec_type"] as? String
+        })
     }
 
-    /// Wanneer we voor het laatst een voortgangsregel in het log zetten.
+    private func validRecording(at path: String) async -> Bool {
+        await recordingStreams(at: path).isSuperset(of: ["video", "audio"])
+    }
+
+    private func reddenNaFout(root: URL, url: String, tag: String, label: String) async -> String? {
+        guard let id = extractYouTubeID(from: url), let names = try? FileManager.default.contentsOfDirectory(atPath: root.path) else {
+            return nil
+        }
+        let extensions = ["mkv", "mp4", "webm", "m4a"]
+        let plainSuffix = "[\(tag)] (\(id))"
+        let qualityPattern = #"\["# + NSRegularExpression.escapedPattern(for: tag)
+            + #"\] \[[^\[\]]+\] \("# + NSRegularExpression.escapedPattern(for: id) + #"\)$"#
+        let trackPattern = #"\.f[0-9A-Za-z_-]+$"#
+        var tracksByStem: [String: (video: URL?, audio: URL?)] = [:]
+
+        for name in names.sorted() {
+            let file = root.appendingPathComponent(name)
+            guard extensions.contains(file.pathExtension.lowercased()) else { continue }
+            let base = file.deletingPathExtension().lastPathComponent
+            let isTrack = base.range(of: trackPattern, options: .regularExpression) != nil
+            let stem = base.replacingOccurrences(of: trackPattern, with: "", options: .regularExpression)
+            let matchesPlain = stem.hasSuffix(plainSuffix)
+            let matchesNamedQuality = stem.range(of: qualityPattern, options: .regularExpression) != nil
+            guard matchesPlain || matchesNamedQuality else { continue }
+
+            let streams = await recordingStreams(at: file.path)
+            if streams.isSuperset(of: ["video", "audio"]) {
+                return file.path
+            }
+            guard isTrack, matchesPlain else { continue }
+            var tracks = tracksByStem[stem] ?? (video: nil, audio: nil)
+            if tracks.video == nil, streams.contains("video") { tracks.video = file }
+            if tracks.audio == nil, streams.contains("audio") { tracks.audio = file }
+            tracksByStem[stem] = tracks
+        }
+
+        guard let ffmpegPath,
+              let stem = tracksByStem.keys.sorted().first(where: {
+                  tracksByStem[$0]?.video != nil && tracksByStem[$0]?.audio != nil
+              }),
+              let video = tracksByStem[stem]?.video, let audio = tracksByStem[stem]?.audio else { return nil }
+        let temporary = root.appendingPathComponent(".reprise-recovery-\(UUID().uuidString).mkv")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        var destination = root.appendingPathComponent(stem + ".mkv")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            destination = root.appendingPathComponent("Recovered \(UUID().uuidString) \(stem).mkv")
+        }
+        let (status, _, error) = await runProcess(ffmpegPath, [
+            "-v", "error", "-n", "-i", video.path, "-i", audio.path,
+            "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", temporary.path
+        ])
+        guard status == 0, await validRecording(at: temporary.path) else {
+            log("[\(label)] Recovery merge failed: \(tail(error))")
+            return nil
+        }
+        do {
+            try FileManager.default.moveItem(at: temporary, to: destination)
+        } catch {
+            log("[\(label)] Could not save the recovered recording: \(error)")
+            return nil
+        }
+        // Keep the source tracks after recovery. A playable merge can still be shorter
+        // than the broadcast, especially when a live connection dropped.
+        return destination.path
+    }
+
     private var laatsteVoortgangLog: [UUID: Date] = [:]
 
     /// yt-dlp's eigen uitvoer in het log, zoals je het in een terminal zou
@@ -1380,13 +1461,7 @@ final class MonitorEngine: ObservableObject {
             } else {
                 downloadProgress[videoId] = "\(draaiend(videoId)) working…"
             }
-        } else if trimmed.hasPrefix("REPRISE_FORMAT:") {
-            lastCapturedFormatId[videoId] = String(trimmed.dropFirst("REPRISE_FORMAT:".count))
-        } else if trimmed.hasPrefix("REPRISE_NOTE:") {
-            lastCapturedFormatNote[videoId] = String(trimmed.dropFirst("REPRISE_NOTE:".count))
-        } else if !trimmed.hasPrefix("[") && !trimmed.hasPrefix("ERROR") && !trimmed.hasPrefix("WARNING") {
-            // This is presumably the --print after_move:filepath line.
-            lastCapturedFilePath[videoId] = trimmed
+
         }
     }
 
@@ -1665,7 +1740,8 @@ final class MonitorEngine: ObservableObject {
         // the name — reddenNaFout() greps for it to salvage a stream that ended
         // before the merge — but where it sits is free, so it doesn't need to
         // clutter the part you actually read.
-        let outTemplate = downloadRoot.appendingPathComponent(
+        let root = downloadRoot
+        let outTemplate = root.appendingPathComponent(
             "%(title)s [\(tag)] (%(id)s).%(ext)s").path
         var args = [
             "--force-ipv4",
@@ -1691,10 +1767,7 @@ final class MonitorEngine: ObservableObject {
             // ook op macOS — waar een gewone "|" gewoon toegestaan is. Dat gaf
             // bestandsnamen met rare tekens terwijl het origineel prima kon.
             "--no-windows-filenames",
-            "--print", "after_move:%(filepath)s",
-            // Tagged so processDownloadLine can tell this apart from the filepath
-            // print above — both are otherwise just a bare, unbracketed stdout
-            // line. Used to detect the "18" fallback (see heeftEchteMerge below).
+            "--print", "after_move:REPRISE_PATH:%(filepath)s",
             "--print", "after_move:REPRISE_FORMAT:%(format_id)s",
             // Human-readable counterpart to REPRISE_FORMAT above (e.g. "137" means
             // nothing to a human in a push notification; "1080p" or "1080p Premium"
@@ -1753,9 +1826,6 @@ final class MonitorEngine: ObservableObject {
 
         log("[\(label)] Starting download (\(tag))")
         downloadProgress[videoId] = "0%"
-        lastCapturedFilePath[videoId] = nil
-        lastCapturedFormatId[videoId] = nil
-        lastCapturedFormatNote[videoId] = nil
 
         // Complete, unfiltered yt-dlp output for this download — every attempt
         // (including retries below) appended in order, written to a .ytdlp.log
@@ -1774,9 +1844,10 @@ final class MonitorEngine: ObservableObject {
             transcript += "===== \(naam) =====\n--- stdout ---\n\(out)\n--- stderr ---\n\(err)\n\n"
         }
 
+        let gebruikteCookiesDezePoging = !cookiesGeweigerd && browser != nil
         var (rc, out, err) = await runDownloadProcess(ytDlpPath, args, videoId: videoId)
         appendAttempt("Attempt 1", out, err)
-        let gebruikteCookiesDezePoging = !cookiesGeweigerd && browser != nil
+        let initialResult = downloadResult(in: out)
 
         // Zelfde verhaal als bij het ophalen van de gegevens: YouTube's
         // bot-check faalt met cookies erbij, en anoniem lukt het gewoon.
@@ -1784,12 +1855,9 @@ final class MonitorEngine: ObservableObject {
             log("[\(label)] YouTube's bot-check failed with cookies attached — retrying without cookies.")
             cookiesGeweigerd = true
             let zonder = args.filter { $0 != "--cookies-from-browser" && $0 != browser?.ytdlpName }
-            lastCapturedFilePath[videoId] = nil
-            lastCapturedFormatId[videoId] = nil
-            lastCapturedFormatNote[videoId] = nil
             (rc, out, err) = await runDownloadProcess(ytDlpPath, zonder, videoId: videoId)
             appendAttempt("Retry without cookies (bot-check)", out, err)
-        } else if rc == 0, !isLive, gebruikteCookiesDezePoging, let fmt = lastCapturedFormatId[videoId], !fmt.contains("+") {
+        } else if rc == 0, !isLive, gebruikteCookiesDezePoging, let fmt = initialResult.formatId, !fmt.contains("+") {
             // !isLive: a live capture only returns once the stream has already
             // ended (runDownloadProcess blocks for the whole --live-from-start
             // duration, potentially hours). By the time this check runs, the
@@ -1826,26 +1894,22 @@ final class MonitorEngine: ObservableObject {
             // het noodformaat-bestand na een geslaagde herpoging gewoon naast het
             // goede bestand staan (bevestigd 10-10-2026, handmatig opgemerkt en
             // opgeruimd bij Tiësto).
-            let noodformaatPad = lastCapturedFilePath[videoId]
             let zonder = args.filter { $0 != "--cookies-from-browser" && $0 != browser?.ytdlpName }
-            lastCapturedFilePath[videoId] = nil
-            lastCapturedFormatId[videoId] = nil
-            lastCapturedFormatNote[videoId] = nil
             (rc, out, err) = await runDownloadProcess(ytDlpPath, zonder, videoId: videoId)
             appendAttempt("Retry without cookies (noodformaat)", out, err)
-            if rc == 0, let noodformaatPad, noodformaatPad != lastCapturedFilePath[videoId] {
-                try? FileManager.default.removeItem(atPath: noodformaatPad)
+            let retry = downloadResult(in: out)
+            if rc == 0, retry.formatId?.contains("+") == true, let replacement = retry.path,
+               let fallback = initialResult.path, fallback != replacement,
+               await validRecording(at: replacement) {
+                try? FileManager.default.removeItem(atPath: fallback)
             }
         }
         downloadProgress[videoId] = nil
-        let capturedPath = lastCapturedFilePath[videoId]
-        let capturedFormatId = lastCapturedFormatId[videoId]
-        let capturedQualityLabel = qualityLabel(fromFormatNote: lastCapturedFormatNote[videoId])
-        lastCapturedFilePath[videoId] = nil
-        lastCapturedFormatId[videoId] = nil
-        lastCapturedFormatNote[videoId] = nil
+        let result = downloadResult(in: out)
+        let capturedFormatId = result.formatId
+        let capturedQualityLabel = qualityLabel(fromFormatNote: result.note)
 
-        if rc == 0 {
+        if rc == 0, let capturedPath = result.path, await validRecording(at: capturedPath) {
             // Bakes the real, resolved quality (e.g. "1080p Premium", not whatever
             // VideoQuality was *requested*) into the filename itself, right after the
             // [LIVE]/[VOD] tag — same info already shown in the push notification, but
@@ -1864,7 +1928,7 @@ final class MonitorEngine: ObservableObject {
             let qualityConfirmed: Bool? = (expectedHeight != nil && achieved != nil) ? (achieved! >= expectedHeight!) : nil
 
             var finalPath = capturedPath
-            if let capturedPath {
+            do {
                 let original = URL(fileURLWithPath: capturedPath)
                 let dir = original.deletingLastPathComponent()
                 let originalBase = original.deletingPathExtension().lastPathComponent
@@ -1885,6 +1949,8 @@ final class MonitorEngine: ObservableObject {
                     let renamedVideo = dir.appendingPathComponent(renamedBase + "." + original.pathExtension)
                     if (try? FileManager.default.moveItem(at: original, to: renamedVideo)) != nil {
                         finalPath = renamedVideo.path
+                    } else {
+                        renamedBase = originalBase
                     }
                 }
                 // --write-thumbnail/--convert-thumbnails write under the *original*
@@ -1918,7 +1984,7 @@ final class MonitorEngine: ObservableObject {
                 await writeArchiveInfoFile(
                     dir: dir, base: renamedBase, url: url, meta: meta, tag: tag,
                     formatId: capturedFormatId, qualityLabel: capturedQualityLabel,
-                    videoPath: finalPath ?? capturedPath,
+                    videoPath: finalPath,
                     expectedHeight: expectedHeight, achieved: achieved, qualityConfirmed: qualityConfirmed)
                 // DOWNLOADED first — on request 17-10-2026, so the one thing most
                 // worth knowing doesn't require scrolling past a full yt-dlp
@@ -1935,12 +2001,12 @@ final class MonitorEngine: ObservableObject {
             }
             switch qualityConfirmed {
             case true:
-                log("[\(label)] Download complete (\(tag)) → \(finalPath ?? outTemplate) ✅ confirmed best available for this video")
+                log("[\(label)] Download complete (\(tag)) → \(finalPath) ✅ confirmed best available for this video")
             case false:
-                log("[\(label)] Download complete (\(tag)) → \(finalPath ?? outTemplate) ⚠️ got \(achieved ?? 0)p, "
+                log("[\(label)] Download complete (\(tag)) → \(finalPath) ⚠️ got \(achieved ?? 0)p, "
                     + "but \(expectedHeight ?? 0)p was actually available — check the .ytdlp.log")
             case nil:
-                log("[\(label)] Download complete (\(tag)) → \(finalPath ?? outTemplate)")
+                log("[\(label)] Download complete (\(tag)) → \(finalPath)")
             }
             return (true, finalPath, capturedFormatId, capturedQualityLabel, qualityConfirmed)
         }
@@ -1953,7 +2019,7 @@ final class MonitorEngine: ObservableObject {
 
         // Foutcode is hier geen eindoordeel: zie reddenNaFout. Eerst kijken wat
         // er op schijf staat, dan pas iemand wakker maken.
-        if let gered = await reddenNaFout(url: url, tag: tag, label: label) {
+        if let gered = await reddenNaFout(root: root, url: url, tag: tag, label: label) {
             log("[\(label)] Done despite the error code (\(tag)) → \(gered)")
             // Geen format_id beschikbaar hier — de --print after_move-regel vuurt
             // alleen bij een schone afsluiting, en dit pad is juist voor een
@@ -1993,7 +2059,8 @@ final class MonitorEngine: ObservableObject {
             return (true, gered, nil, nil, nil)
         }
 
-        log("[\(label)] Download failed (\(tag), rc=\(rc)): \(tail(err, lines: 12))")
+        let failure = rc == 0 ? "yt-dlp exited successfully, but no playable recording was verified." : tail(err, lines: 12)
+        log("[\(label)] Download failed (\(tag), rc=\(rc)): \(failure)")
         // No real output file to match a name with, but the transcript is often the
         // only place that shows *why* — written under a name that's at least found
         // next to the (failed) video. No colons: same reasoning as --no-windows-filenames
@@ -2009,7 +2076,7 @@ final class MonitorEngine: ObservableObject {
         let faalFormatter = DateFormatter()
         faalFormatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let failedLogName = "\(veiligLabel) [\(tag)] — FAILED \(faalFormatter.string(from: Date())).ytdlp.log"
-        try? (formatsSection + transcript).write(to: downloadRoot.appendingPathComponent(failedLogName), atomically: true, encoding: .utf8)
+        try? (formatsSection + transcript).write(to: root.appendingPathComponent(failedLogName), atomically: true, encoding: .utf8)
         return (false, nil, nil, nil, nil)
     }
 
@@ -2610,10 +2677,23 @@ final class MonitorEngine: ObservableObject {
     /// 26-09-2026: the row's trash button isn't disabled during an active download.
     private func writeBack(_ v: MonitoredVideo, id: UUID) {
         guard let idx = videos.firstIndex(where: { $0.id == id }) else { return }
-        videos[idx] = v
+        let current = videos[idx]
+        guard current.url == v.url else { return }
+        var updated = v
+        updated.label = current.label
+        updated.quality = current.quality
+        updated.downloadAltPremiumCodec = current.downloadAltPremiumCodec
+        if current.scheduledDate != v.scheduledDate {
+            updated.scheduledDate = current.scheduledDate
+            updated.dayBeforeCheckNotified = current.dayBeforeCheckNotified
+            updated.hourBeforeCheckNotified = current.hourBeforeCheckNotified
+        }
+        guard current != updated else { return }
+        videos[idx] = updated
+        saveSchedule()
     }
 
-    private func checkOneVideo(index: Int, forceCheck: Bool = false) async {
+    private func checkOneVideo(index: Int, forceCheck: Bool = false, acceptAvailableVod: Bool = false) async {
         guard videos.indices.contains(index) else { return }
         let videoId = videos[index].id
         guard !checkingNow.contains(videoId) else {
@@ -2633,6 +2713,12 @@ final class MonitorEngine: ObservableObject {
         //
         // Inhoudelijk is de VOD ook de volledige versie; de live-opname is het
         // vangnet voor als er nooit een VOD komt.
+        if v.status == .downloadingVod && !v.vodDone {
+            v.status = .vodPending
+            v.vodWaitingSince = v.vodWaitingSince ?? v.liveFinishedAt ?? Date()
+            v.vodWaitReason = "The previous VOD download was interrupted."
+            writeBack(v, id: videoId)
+        }
         if v.vodDone {
             // vodDone staying true forever if the file disappears meant this guard
             // returned before any download logic ran at all — "Check now" did
@@ -2641,20 +2727,22 @@ final class MonitorEngine: ObservableObject {
             // return fired first regardless of forceCheck). Checking the file is
             // still actually there turns a silent dead end back into a normal
             // re-download.
-            if let path = v.finalFilePath, !FileManager.default.fileExists(atPath: path) {
-                log("[\(v.label)] VOD file is missing (\(path)) — will download it again.")
-                v.vodDone = false
-                v.status = v.liveDone ? .vodPending : .waiting
-                writeBack(v, id: videoId)
-            } else {
+            if let path = v.finalFilePath, FileManager.default.isReadableFile(atPath: path) {
                 if v.status != .done { v.status = .done; writeBack(v, id: videoId) }
                 return
             }
+            log("[\(v.label)] VOD file is missing — will download it again.")
+            v.vodDone = false
+            v.finalFilePath = v.liveFilePath
+            v.status = .vodPending
+            v.vodWaitingSince = Date()
+            v.vodWaitReason = "The saved VOD could not be found."
+            writeBack(v, id: videoId)
         }
 
         if !forceCheck {
             // Before the window around the scheduled time: don't check anything at all.
-            if !v.liveDone {
+            if !v.liveDone && v.status != .vodPending {
                 let checkFrom = v.scheduledDate.addingTimeInterval(-checkLeadTime)
                 if Date() < checkFrom {
                     if v.status != .waiting { v.status = .waiting; writeBack(v, id: videoId) }
@@ -2682,7 +2770,8 @@ final class MonitorEngine: ObservableObject {
             // seconds later. Skipping it once here costs nothing — a video that's
             // genuinely still stalled will hit this same threshold again on its
             // second check, lastChecked no longer nil, and notify correctly then.
-            if !v.liveDone && v.lastChecked != nil && Date().timeIntervalSince(v.scheduledDate) > stillWaitingThreshold {
+            if !v.liveDone && v.status != .vodPending && v.lastChecked != nil
+                && Date().timeIntervalSince(v.scheduledDate) > stillWaitingThreshold {
                 if v.stillWaitingNotified != true {
                     v.stillWaitingNotified = true
                     writeBack(v, id: videoId)
@@ -2700,12 +2789,12 @@ final class MonitorEngine: ObservableObject {
             }
 
             // Once LIVE is already captured and we're only waiting for the VOD: check less often.
-            if v.liveDone && !v.vodDone {
+            if (v.liveDone || v.status == .vodPending) && !v.vodDone {
                 let last = lastVodCheck[v.id]
                 if let last, Date().timeIntervalSince(last) < vodWaitInterval {
                     return
                 }
-                lastVodCheck[v.id] = Date()
+
             }
         }
 
@@ -2714,10 +2803,13 @@ final class MonitorEngine: ObservableObject {
             log("[\(v.label)] Check window started (scheduled time: \(v.scheduledDate.formatted(date: .abbreviated, time: .standard)))")
         }
 
+        if v.liveDone || v.status == .vodPending { lastVodCheck[v.id] = Date() }
         let result = await fetchMeta(url: v.url)
+        guard videos.contains(where: { $0.id == v.id && $0.url == v.url }) else { return }
         v.lastChecked = Date()
         guard let meta = result.meta else {
             let detail = tail(result.stderr)
+            if v.status == .vodPending { v.vodWaitReason = "Could not check YouTube." }
             log("[\(v.label)] Check failed — could not fetch metadata (rc=\(result.exitCode)): \(detail)")
             writeBack(v, id: videoId)
             // Tot 26-09-2026 bleef dit stil: alleen een download-mislukking
@@ -2743,6 +2835,12 @@ final class MonitorEngine: ObservableObject {
         // formats are here.
         if hasPremiumFormat(meta: meta) { settings.youtubePremiumConfirmed = true }
 
+        let hasVodFormats = !((meta["formats"] as? [Any])?.isEmpty ?? true)
+        if acceptAvailableVod && (phase != "vod" || !hasVodFormats || liveStatus == "is_upcoming" || liveStatus == "post_live") {
+            v.vodWaitReason = "YouTube has not made a downloadable VOD available yet."
+            writeBack(v, id: videoId)
+            return
+        }
         if phase == "live", !v.liveDone {
             // Na een mislukking even wachten. Zonder dit startte elke ronde van
             // dertig seconden een nieuwe poging die binnen twee seconden weer
@@ -2763,7 +2861,11 @@ final class MonitorEngine: ObservableObject {
             if let path { v.finalFilePath = path }
             v.status = ok ? .vodPending : .waiting
             if ok {
-                v.liveFinishedAt = Date()
+                let finished = Date()
+                v.liveFinishedAt = finished
+                v.liveFilePath = path
+                v.vodWaitingSince = finished
+                v.vodWaitReason = "Waiting for YouTube to publish the VOD."
                 notify(title: "Live download complete", message: "\(v.label) — now waiting for the VOD version.")
             } else {
                 v.retryNotBefore = Date().addingTimeInterval(5 * 60)
@@ -2782,7 +2884,10 @@ final class MonitorEngine: ObservableObject {
             // we know exactly when it ended); if the live window was missed
             // entirely there's no such timestamp to wait from, so that case still
             // proceeds immediately as before.
-            if let finishedAt = v.liveFinishedAt, Date().timeIntervalSince(finishedAt) < vodFormatSettleDelay {
+            v.vodWaitingSince = v.vodWaitingSince ?? v.liveFinishedAt ?? Date()
+            lastVodCheck[v.id] = lastVodCheck[v.id] ?? Date()
+            if !acceptAvailableVod, let finishedAt = v.liveFinishedAt, Date().timeIntervalSince(finishedAt) < vodFormatSettleDelay {
+                v.vodWaitReason = "Giving YouTube time to process higher-quality formats."
                 writeBack(v, id: videoId)
                 return
             }
@@ -2795,7 +2900,8 @@ final class MonitorEngine: ObservableObject {
             // of just trusting a clock means this can wait longer when it
             // genuinely needs to, instead of guessing a bigger fixed number
             // that's still sometimes wrong.
-            if v.liveFinishedAt != nil, !heeftAdaptieveFormaten(meta) {
+            if !acceptAvailableVod, v.liveFinishedAt != nil, !heeftAdaptieveFormaten(meta) {
+                v.vodWaitReason = "YouTube has published the VOD, but higher-quality formats are still processing."
                 log("[\(v.label)] VOD is er, maar nog niet in volledige kwaliteit — nog even wachten.")
                 writeBack(v, id: videoId)
                 return
@@ -2804,6 +2910,7 @@ final class MonitorEngine: ObservableObject {
                 notify(title: "VOD download started", message: "\(v.label) — downloading the VOD now.")
                 v.vodNotified = true
             }
+            if v.liveFilePath == nil { v.liveFilePath = liveRecordingPath(v) }
             v.status = .downloadingVod
             writeBack(v, id: videoId)
             let (ok, path, formatId, qualityLabel, qualityConfirmed) = await downloadVideo(url: v.url, label: v.label, tag: "VOD", isLive: false, videoId: v.id, quality: v.quality ?? .best, meta: meta)
@@ -2821,16 +2928,18 @@ final class MonitorEngine: ObservableObject {
             // means a next attempt would otherwise just see it sitting there and
             // skip re-downloading forever, quietly keeping the noodformaat for
             // good instead of trying again.
-            if ok, v.liveFinishedAt != nil, let formatId, !formatId.contains("+") {
+            if ok, !acceptAvailableVod, v.liveFinishedAt != nil, let formatId, !formatId.contains("+") {
                 log("[\(v.label)] ⚠️ VOD kwam binnen als noodformaat (\(formatId), geen losse hoge-kwaliteit-sporen) — weggegooid, probeer later opnieuw.")
                 if let path { try? FileManager.default.removeItem(atPath: path) }
                 v.status = .vodPending
+                v.vodWaitReason = "The higher-quality tracks could not be downloaded yet."
                 writeBack(v, id: videoId)
                 return
             }
             v.vodDone = ok
             if let path { v.finalFilePath = path }
             v.status = ok ? .done : .vodPending
+            v.vodWaitReason = ok ? nil : "The last VOD download attempt failed."
             if ok {
                 v.qualityConfirmed = qualityConfirmed
                 v.vodVersion = DownloadedVersion.from(
@@ -2868,6 +2977,7 @@ final class MonitorEngine: ObservableObject {
                     notify(title: "VOD downloaded", message: "\(v.label) — VOD saved\(kwaliteit)\(bevestiging). The live broadcast wasn't "
                         + "captured separately (the live window was likely missed).")
                 }
+                writeBack(v, id: videoId)
                 // Opt-in per video (see MonitoredVideo.downloadAltPremiumCodec) — best
                 // effort, after the primary file already landed: never holds up or
                 // affects the primary download's own success/notification above.
@@ -2882,7 +2992,12 @@ final class MonitorEngine: ObservableObject {
             // can briefly return nil right after a live capture (e.g. YouTube hasn't finished
             // processing the ended stream into a VOD yet), and resetting to .waiting here made
             // the row look like it hadn't started at all despite liveDone already being true.
-            v.status = v.liveDone ? .vodPending : .waiting
+            if v.liveDone || v.status == .vodPending {
+                v.status = .vodPending
+                v.vodWaitReason = "Waiting for YouTube to publish the VOD."
+            } else {
+                v.status = .waiting
+            }
         }
         writeBack(v, id: videoId)
     }
@@ -2934,7 +3049,7 @@ final class MonitorEngine: ObservableObject {
     /// before the next milestone opens — so a late app launch doesn't fire a "1 day
     /// before" notice five minutes before showtime, and a stalled/cancelled premiere
     /// doesn't get an "1 hour before" notice days after the fact.
-    private func checkReadinessMilestones(index: Int) async {
+    private func checkReadinessMilestones(index: Int) {
         guard videos.indices.contains(index) else { return }
         let videoId = videos[index].id
         var v = videos[index]
@@ -2944,16 +3059,19 @@ final class MonitorEngine: ObservableObject {
         let dayBefore = v.scheduledDate.addingTimeInterval(-86400)
         let hourBefore = v.scheduledDate.addingTimeInterval(-3600)
 
+        let milestone: String
         if v.dayBeforeCheckNotified != true, now >= dayBefore, now < hourBefore {
             v.dayBeforeCheckNotified = true
-            writeBack(v, id: videoId)
-            await sendReadinessCheck(for: v, milestone: "1 day before")
-        }
-        if v.hourBeforeCheckNotified != true, now >= hourBefore, now < v.scheduledDate.addingTimeInterval(900) {
+            milestone = "1 day before"
+        } else if v.hourBeforeCheckNotified != true, now >= hourBefore, now < v.scheduledDate.addingTimeInterval(900) {
             v.hourBeforeCheckNotified = true
-            writeBack(v, id: videoId)
-            await sendReadinessCheck(for: v, milestone: "1 hour before")
+            milestone = "1 hour before"
+        } else {
+            return
         }
+        writeBack(v, id: videoId)
+        let video = v
+        Task { [weak self] in await self?.sendReadinessCheck(for: video, milestone: milestone) }
     }
 
     /// Reprise's own current version, read from the bundle — stamped from Resources/VERSION
@@ -2964,43 +3082,37 @@ final class MonitorEngine: ObservableObject {
     }
 
 
-    private func tick() async {
-        // Vóór de guard: deze mag ook draaien als er (nog) geen video's
-        // gevolgd worden. checkYtDlpVersion() en checkCookieLogin() remmen
-        // zichzelf af tot 1x/dag.
-        await checkYtDlpVersion()
-        await checkCookieLogin()
-        await checkChannels()
-        checkDiskSpace()
-        checkExternalTools()
+    private var maintenanceTask: Task<Void, Never>?
+    private var scheduledVideoChecks: Set<UUID> = []
 
-        guard !videos.isEmpty else { return }
-        // Used to be a plain sequential `for index in videos.indices { await ... }` —
-        // which meant a single multi-GB download (an `await` that can run for many
-        // minutes, see downloadVideo) blocked this entire loop from ever reaching the
-        // next video, even though MainActor was otherwise free to interleave it.
-        // Two premieres going live close together would have had the second one
-        // miss its live window entirely, stuck waiting behind the first one's
-        // download. A TaskGroup gives every video its own child task that
-        // independently reaches its own `await` points instead; checkingNow (keyed
-        // per video id) still prevents a video from being checked twice at once, and
-        // writeBack already resolves by id rather than a captured index, so this is
-        // safe even if the list changes (an add/delete) while checks are in flight.
-        await withTaskGroup(of: Void.self) { group in
-            for id in videos.map(\.id) {
-                group.addTask { @MainActor [weak self] in
-                    await self?.checkOneVideoTick(id: id)
-                }
+    private func tick() {
+        if maintenanceTask == nil {
+            maintenanceTask = Task { [weak self] in
+                guard let self else { return }
+                defer { self.maintenanceTask = nil }
+                await self.checkYtDlpVersion()
+                await self.checkCookieLogin()
+                await self.checkChannels()
+                self.checkDiskSpace()
+                self.checkExternalTools()
             }
         }
-        Store.save(videos)
+
+        for id in videos.map(\.id) where !checkingNow.contains(id) {
+            guard scheduledVideoChecks.insert(id).inserted else { continue }
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.scheduledVideoChecks.remove(id) }
+                await self.checkOneVideoTick(id: id)
+            }
+        }
     }
 
     private func checkOneVideoTick(id: UUID) async {
-        guard let idx = videos.firstIndex(where: { $0.id == id }) else { return }
-        await checkReadinessMilestones(index: idx)
-        guard let idx2 = videos.firstIndex(where: { $0.id == id }) else { return }
-        await checkOneVideo(index: idx2)
+        guard let index = videos.firstIndex(where: { $0.id == id }) else { return }
+        checkReadinessMilestones(index: index)
+        await checkOneVideo(index: index)
     }
+
 }
 

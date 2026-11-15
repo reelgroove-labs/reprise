@@ -125,6 +125,9 @@ struct MonitoredVideo: Identifiable, Codable, Equatable {
     var vodDone: Bool = false
     var lastChecked: Date? = nil
     var finalFilePath: String? = nil
+    var liveFilePath: String? = nil
+    var vodWaitingSince: Date? = nil
+    var vodWaitReason: String? = nil
     /// Of de "premiere is live"-melding al verstuurd is. Losgekoppeld van
     /// liveDone, want dat vlaggetje gaat pas aan bij een geslaagde download —
     /// waardoor een mislukking elke ronde opnieuw dezelfde melding stuurde.
@@ -231,7 +234,7 @@ func formattedCountdown(to date: Date) -> String {
     return "in \(minutes)m"
 }
 
-/// A YouTube channel Reprise checks daily for newly scheduled premieres — the
+/// A YouTube channel Reprise checks periodically for newly scheduled premieres — the
 /// user's "watch this channel for upcoming stuff" idea (30-09-2026), so they
 /// don't have to go find+paste each premiere URL themselves.
 struct TrackedChannel: Identifiable, Codable, Equatable {
@@ -244,6 +247,7 @@ struct TrackedChannel: Identifiable, Codable, Equatable {
     /// surfaces genuinely new ones instead of re-reporting the same premiere
     /// every day until it airs.
     var knownUpcomingIDs: [String] = []
+    var automaticallySchedules: Bool? = nil
     var lastChecked: Date? = nil
 }
 
@@ -270,6 +274,11 @@ struct AppSettings: Codable, Equatable {
     var checkLeadMinutes: Double = 15
     /// How often (in minutes) we check once LIVE is already captured and we're waiting for the VOD.
     var vodWaitMinutes: Double = 2
+    var vodFallbackMinutes: Double? = nil
+    var channelCheckMinutes: Double? = nil
+
+    var vodFallbackInterval: TimeInterval { max(3, vodFallbackMinutes ?? 30) * 60 }
+    var channelCheckInterval: TimeInterval { max(5, channelCheckMinutes ?? 30) * 60 }
     /// Don't send a failure notification for the same premiere more often than this (in minutes).
     var failureCooldownMinutes: Double = 5
     /// Custom download location; nil = default ~/Downloads/Reprise.

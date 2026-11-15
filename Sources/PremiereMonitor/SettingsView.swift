@@ -8,6 +8,9 @@ struct SettingsView: View {
 
     @State private var checkLeadMinutes: Double
     @State private var vodWaitMinutes: Double
+    @State private var vodFallbackMinutes: Double
+    @State private var channelCheckMinutes: Double
+    @State private var automaticSchedulingChanges: [UUID: Bool] = [:]
     @State private var failureCooldownMinutes: Double
     @State private var customDownloadPath: String
     @State private var lowDiskThresholdGB: Double
@@ -85,6 +88,8 @@ struct SettingsView: View {
         let s = MonitorEngine.shared.settings
         _checkLeadMinutes = State(initialValue: s.checkLeadMinutes)
         _vodWaitMinutes = State(initialValue: s.vodWaitMinutes)
+        _vodFallbackMinutes = State(initialValue: s.vodFallbackInterval / 60)
+        _channelCheckMinutes = State(initialValue: s.channelCheckInterval / 60)
         _failureCooldownMinutes = State(initialValue: s.failureCooldownMinutes)
         _customDownloadPath = State(initialValue: s.customDownloadPath ?? "")
         _lowDiskThresholdGB = State(initialValue: s.lowDiskThresholdGB ?? 5)
@@ -310,6 +315,14 @@ struct SettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
+                Text("Offer the available VOD after")
+                    .font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+                Stepper(value: $vodFallbackMinutes, in: 3...1440, step: 1) {
+                    Text("\(Int(vodFallbackMinutes)) minutes")
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
                 Text("Minimum time between failure notifications (minutes)")
                     .font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
                 Stepper(value: $failureCooldownMinutes, in: 1...60, step: 1) {
@@ -332,8 +345,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Watch a channel for new premieres")
                     .font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
-                Text("Checked once a day. Found premieres show up in the main window for you "
-                    + "to add with one click — no need to go find the URL on YouTube yourself.")
+                Text("Discoveries appear in Incoming. Enable Auto-schedule for a channel to add premieres with a known start time directly to Scheduled.")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 HStack {
@@ -343,6 +355,10 @@ struct SettingsView: View {
                     Button("Add", action: addChannel)
                         .disabled(newChannelURL.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
+            }
+
+            Stepper(value: $channelCheckMinutes, in: 5...1440, step: 5) {
+                Text("Check channels every \(Int(channelCheckMinutes)) minutes")
             }
 
             if engine.channels.isEmpty {
@@ -367,6 +383,11 @@ struct SettingsView: View {
                                 }
                             }
                             Spacer()
+                            Toggle("Auto-schedule", isOn: Binding(
+                                get: { automaticSchedulingChanges[channel.id] ?? channel.automaticallySchedules ?? false },
+                                set: { automaticSchedulingChanges[channel.id] = $0 }
+                            ))
+                            .help("Schedule premieres from this channel using your default video quality")
                             Button {
                                 engine.checkChannelNow(channel)
                             } label: {
@@ -728,6 +749,8 @@ struct SettingsView: View {
     private func save() {
         engine.settings.checkLeadMinutes = checkLeadMinutes
         engine.settings.vodWaitMinutes = vodWaitMinutes
+        engine.settings.vodFallbackMinutes = vodFallbackMinutes
+        engine.settings.channelCheckMinutes = channelCheckMinutes
         engine.settings.failureCooldownMinutes = failureCooldownMinutes
         engine.settings.customDownloadPath = customDownloadPath.isEmpty ? nil : customDownloadPath
         engine.settings.lowDiskThresholdGB = lowDiskThresholdGB
@@ -738,6 +761,9 @@ struct SettingsView: View {
         engine.settings.youtubePremiumConfirmed = hasYouTubePremium
         engine.settings.pushoverToken = pushoverToken.isEmpty ? nil : pushoverToken
         engine.settings.pushoverUserKey = pushoverUserKey.isEmpty ? nil : pushoverUserKey
+        for (channelID, enabled) in automaticSchedulingChanges {
+            engine.setAutomaticScheduling(enabled, channelID: channelID)
+        }
         StatusItemController.shared?.refreshActivationPolicy()
         StatusItemController.shared?.refreshIcon()
 
