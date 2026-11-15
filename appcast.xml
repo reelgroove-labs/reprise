@@ -5,6 +5,17 @@
         <description>Reprise release updates.</description>
         <language>en</language>
         <item>
+            <title>Version 1.6.79</title>
+            <sparkle:version>1.6.79</sparkle:version>
+            <sparkle:shortVersionString>1.6.79</sparkle:shortVersionString>
+            <description><![CDATA[Includes the recording reliability fixes, automatic channel scheduling, VOD fallback controls and schedule recovery.
+
+The refreshed Scheduled view prioritizes active recordings and shows clearer Waiting for premiere and Waiting for VOD labels.]]></description>
+            <pubDate>Sun, 15 Nov 2026 11:53:33 +0000</pubDate>
+            <enclosure url="https://github.com/reprise-labs/reprise/releases/download/1.6.79/Reprise.zip" length="4848810" type="application/octet-stream" sparkle:edSignature="JfBbNoyPvNqAuPSUmOcZ3OhHGIUa4h1xPs/GlhpLlheemPPNFv/2RyZ9cSZ8H6so6Qje/lqVXi5ALL4PJiRbBA==" />
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+        </item>
+        <item>
             <title>Version 1.6.75</title>
             <sparkle:version>1.6.75</sparkle:version>
             <sparkle:shortVersionString>1.6.75</sparkle:shortVersionString>
