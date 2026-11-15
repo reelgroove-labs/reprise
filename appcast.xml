@@ -5,6 +5,17 @@
         <description>Reprise release updates.</description>
         <language>en</language>
         <item>
+            <title>Version 1.6.80</title>
+            <sparkle:version>1.6.80</sparkle:version>
+            <sparkle:shortVersionString>1.6.80</sparkle:shortVersionString>
+            <description><![CDATA[Reprise detects changes to scheduled YouTube premieres and lets you know the old and new start times.
+
+After a restart, Reprise identifies interrupted LIVE and VOD downloads, preserves existing files, and retries in the original download folder when possible.]]></description>
+            <pubDate>Sun, 15 Nov 2026 12:03:55 +0000</pubDate>
+            <enclosure url="https://github.com/reprise-labs/reprise/releases/download/1.6.80/Reprise.zip" length="4864299" type="application/octet-stream" sparkle:edSignature="48tAtkb2H6YHRsdXeT8Dof+8yfYoEVGZDI+JpXDlgQ0bDoLQ1dLAmciw6hKVPTzNHoT28GLafAzI/DirXjMADw==" />
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+        </item>
+        <item>
             <title>Version 1.6.79</title>
             <sparkle:version>1.6.79</sparkle:version>
             <sparkle:shortVersionString>1.6.79</sparkle:shortVersionString>
