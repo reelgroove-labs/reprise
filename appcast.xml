@@ -5,6 +5,15 @@
         <description>Reprise release updates.</description>
         <language>en</language>
         <item>
+            <title>Version 1.6.81</title>
+            <sparkle:version>1.6.81</sparkle:version>
+            <sparkle:shortVersionString>1.6.81</sparkle:shortVersionString>
+            <description><![CDATA[The app now uses the midnight-blue VHS cassette icon that appears on the Reprise GitHub page.]]></description>
+            <pubDate>Sun, 15 Nov 2026 13:25:52 +0000</pubDate>
+            <enclosure url="https://github.com/reprise-labs/reprise/releases/download/1.6.81/Reprise.zip" length="5645277" type="application/octet-stream" sparkle:edSignature="UIFbUCcuhuTMZbHfllQbunTMphsZYmNrubeiBI8PbC6VgdS0BSWOODqQ76otleoUGvbZC3M+MPeibdGV4ixYDw==" />
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+        </item>
+        <item>
             <title>Version 1.6.80</title>
             <sparkle:version>1.6.80</sparkle:version>
             <sparkle:shortVersionString>1.6.80</sparkle:shortVersionString>
