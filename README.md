@@ -1,11 +1,10 @@
 # Reprise
 
-A macOS menu bar app that records YouTube premieres for you. Reprise watches the
-premiere, captures the LIVE broadcast from the very first moment and then fetches the
-final VOD, in the best quality YouTube offers.
-`Première → Live → Reprise`.
+A macOS menu bar app for YouTube premieres. Track scheduled broadcasts, record them
+live and save the final replay in the best available quality. With channel discovery,
+automatic scheduling and recovery after a restart.
 
-![Reprise](Artwork/Reprise.png)
+![Reprise app icon, a VHS cassette in a cream sleeve on a midnight-blue background](Artwork/Reprise.png)
 
 ## Latest release
 
@@ -147,6 +146,12 @@ there.
 
 Reprise is a separate project alongside [Sleeve](https://github.com/reprise-labs/sleeve).
 The two apps have their own versions and downloads.
+
+## Reprise Labs
+
+Reprise is the companion app to [Sleeve](https://github.com/reprise-labs/sleeve).
+Reprise archives premiere recordings. Sleeve helps prepare scans of CDs and vinyl.
+Each app has its own releases.
 
 ## License
 
