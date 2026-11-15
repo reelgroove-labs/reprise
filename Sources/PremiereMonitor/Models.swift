@@ -96,9 +96,9 @@ enum VideoStatus: String, Codable {
 
     var displayName: String {
         switch self {
-        case .waiting: return "Waiting"
+        case .waiting: return "Waiting for premiere"
         case .downloadingLive: return "Downloading LIVE"
-        case .vodPending: return "Waiting for HD VOD"
+        case .vodPending: return "Waiting for VOD"
         case .downloadingVod: return "Downloading VOD"
         case .done: return "Done"
         }

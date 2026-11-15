@@ -568,35 +568,18 @@ private struct NextPremiereCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 16) {
-                VideoThumbnail(video: video, width: 116, height: 65)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(video.label)
-                        .font(.title3.weight(.semibold))
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 10) {
-                        Label(video.scheduledDate.formatted(date: .abbreviated, time: .shortened), systemImage: "calendar")
-                        if let quality = video.quality, quality != .best {
-                            Text(quality.displayName)
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                StatusBadge(status: video.status)
+                if video.status == .waiting, video.scheduledDate > Date() {
+                    Text(video.scheduledDate, style: .relative)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else if isBusy, let progress = engine.downloadProgress[video.id] {
+                    Text(progress)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 12)
-                VStack(alignment: .trailing, spacing: 5) {
-                    StatusBadge(status: video.status)
-                    if video.status == .waiting, video.scheduledDate > Date() {
-                        Text(video.scheduledDate, style: .relative)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    } else if isBusy, let progress = engine.downloadProgress[video.id] {
-                        Text(progress)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                Spacer()
                 Menu {
                     Button("Check now", action: onCheckNow)
                         .disabled(isBusy)
@@ -614,6 +597,26 @@ private struct NextPremiereCard: View {
                 }
                 .menuStyle(.borderlessButton)
                 .accessibilityLabel("Actions for \(video.label)")
+            }
+            .padding(.bottom, 12)
+
+            HStack(alignment: .top, spacing: 16) {
+                VideoThumbnail(video: video, width: 116, height: 65)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(video.label)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        Label(video.scheduledDate.formatted(date: .abbreviated, time: .shortened), systemImage: "calendar")
+                        if let quality = video.quality, quality != .best {
+                            Text(quality.displayName)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
             }
 
             if video.status == .vodPending {
